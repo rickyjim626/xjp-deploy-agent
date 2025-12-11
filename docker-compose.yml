@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  deploy-agent:
+    build: .
+    image: xjp-deploy-agent:latest
+    container_name: xjp-deploy-agent
+    restart: unless-stopped
+    ports:
+      - "9876:9876"
+    environment:
+      - PORT=9876
+      - RUST_LOG=info
+      # API 密钥 - 必须修改！
+      - DEPLOY_AGENT_API_KEY=${DEPLOY_AGENT_API_KEY:-change-me-in-production}
+      # 回调 URL（可选）
+      - DEPLOY_CENTER_CALLBACK_URL=https://auth.xiaojinpro.com
+      # 项目配置
+      - BACKEND_WORK_DIR=/workspace/xiaojinpro-backend
+    volumes:
+      # 挂载工作目录
+      - /root/xiaojinpro-backend:/workspace/xiaojinpro-backend
+      # 挂载 Docker socket 以便执行 docker 命令
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 挂载 SSH 密钥（如果需要 git 操作）
+      - ~/.ssh:/root/.ssh:ro
+      # 挂载 GHCR 认证
+      - ~/.docker/config.json:/root/.docker/config.json:ro
