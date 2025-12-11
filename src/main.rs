@@ -98,17 +98,18 @@ impl AppState {
         // 配置项目
         let mut projects = HashMap::new();
 
-        // xiaojinpro-backend
-        projects.insert(
-            "xiaojinpro-backend".to_string(),
-            ProjectConfig {
-                work_dir: env::var("BACKEND_WORK_DIR")
-                    .unwrap_or_else(|_| "/root/xiaojinpro-backend".to_string()),
-                script: "./build-and-push-backend.sh".to_string(),
-            },
-        );
+        // xiaojinpro-backend (只在 BACKEND_WORK_DIR 存在时添加)
+        if let Ok(work_dir) = env::var("BACKEND_WORK_DIR") {
+            projects.insert(
+                "xiaojinpro-backend".to_string(),
+                ProjectConfig {
+                    work_dir,
+                    script: "./build-and-push-backend.sh".to_string(),
+                },
+            );
+        }
 
-        // 可以从环境变量添加更多项目
+        // 从环境变量添加更多项目
         // 格式: PROJECT_<NAME>_DIR, PROJECT_<NAME>_SCRIPT
         for (key, value) in env::vars() {
             if key.starts_with("PROJECT_") && key.ends_with("_DIR") {
