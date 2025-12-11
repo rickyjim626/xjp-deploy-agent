@@ -487,6 +487,10 @@ async fn run_deploy(
             error!(task_id = %task_id, error = %e, "Failed to spawn process");
             log_line!("stderr", format!("Failed to start script: {}", e));
             update_task_status(&state, &task_id, DeployStatus::Failed, Some(-1)).await;
+            // Notify deploy-center about the failure
+            if let Some(ref callback_url) = state.callback_url {
+                let _ = notify_deploy_center(callback_url, &task_id, &project, &DeployStatus::Failed, -1).await;
+            }
             return;
         }
     };
