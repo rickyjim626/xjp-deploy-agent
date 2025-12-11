@@ -185,6 +185,13 @@ pub struct ErrorResponse {
 /// 版本信息
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 重启响应
+#[derive(Debug, Serialize)]
+pub struct RestartResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 /// 健康检查 - 返回状态、版本、运行时间等信息
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let (active_count, active_projects) = {
@@ -224,6 +231,65 @@ async fn list_projects(
 
     let projects: Vec<&String> = state.projects.keys().collect();
     Ok(Json(serde_json::json!({ "projects": projects })))
+}
+
+/// 重启服务 (通过 systemd-run 延迟重启)
+///
+/// POST /restart
+async fn restart_service(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<RestartResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !state.verify_api_key(&headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "unauthorized".to_string(),
+                message: "Invalid or missing API key".to_string(),
+            }),
+        ));
+    }
+
+    info!("Restart requested, scheduling service restart in 2 seconds...");
+
+    // 使用 systemd-run 延迟 2 秒重启服务
+    let result = Command::new("sudo")
+        .args([
+            "/usr/bin/systemd-run",
+            "--no-block",
+            "--on-active=2s",
+            "/bin/systemctl",
+            "restart",
+            "xjp-deploy-agent",
+        ])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) => {
+            if output.status.success() {
+                info!("Service restart scheduled successfully");
+                Ok(Json(RestartResponse {
+                    success: true,
+                    message: "Service restart scheduled in 2 seconds".to_string(),
+                }))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!("Failed to schedule restart: {}", stderr);
+                Ok(Json(RestartResponse {
+                    success: false,
+                    message: format!("Failed to schedule restart: {}", stderr),
+                }))
+            }
+        }
+        Err(e) => {
+            error!("Failed to run systemd-run: {}", e);
+            Ok(Json(RestartResponse {
+                success: false,
+                message: format!("Failed to run restart command: {}", e),
+            }))
+        }
+    }
 }
 
 /// 触发部署
@@ -815,6 +881,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/status", get(health_check))
         .route("/projects", get(list_projects))
+        .route("/restart", post(restart_service))
         .route("/trigger/:project", post(trigger_deploy))
         .route("/tasks/:task_id", get(get_task_status))
         .route("/logs/:task_id/stream", get(stream_logs))
