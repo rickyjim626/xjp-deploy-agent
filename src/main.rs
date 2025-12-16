@@ -158,6 +158,19 @@ pub enum DeployType {
         /// Git 分支（默认 master）
         branch: Option<String>,
     },
+    /// Xiaojincut 本地视频处理任务
+    Xiaojincut {
+        /// 任务类型: "import", "export", "process"
+        task_type: String,
+        /// 输入文件路径
+        input_path: Option<String>,
+        /// 输出目录
+        output_dir: Option<String>,
+        /// AI 提示（用于 AI 处理任务）
+        prompt: Option<String>,
+        /// xiaojincut 服务端口（默认 19527）
+        port: Option<u16>,
+    },
 }
 
 /// 项目配置
@@ -202,6 +215,17 @@ pub struct RemoteAgentConfig {
     pub env: Option<HashMap<String, String>>,
     /// Timeout in seconds
     pub timeout_secs: Option<u32>,
+    // Xiaojincut 相关字段
+    /// Xiaojincut 任务类型: "import", "export", "process"
+    pub xjc_task_type: Option<String>,
+    /// Xiaojincut 输入文件路径
+    pub xjc_input_path: Option<String>,
+    /// Xiaojincut 输出目录
+    pub xjc_output_dir: Option<String>,
+    /// Xiaojincut AI 提示
+    pub xjc_prompt: Option<String>,
+    /// Xiaojincut 服务端口
+    pub xjc_port: Option<u16>,
 }
 
 fn default_deploy_type() -> String {
@@ -243,6 +267,15 @@ impl RemoteAgentConfig {
                     image,
                     git_repo_dir: Some(work_dir.clone()),
                     service: self.services.as_ref().and_then(|s| s.first().cloned()),
+                }
+            }
+            "xiaojincut" => {
+                DeployType::Xiaojincut {
+                    task_type: self.xjc_task_type.clone().unwrap_or_else(|| "import".to_string()),
+                    input_path: self.xjc_input_path.clone(),
+                    output_dir: self.xjc_output_dir.clone(),
+                    prompt: self.xjc_prompt.clone(),
+                    port: self.xjc_port,
                 }
             }
             _ => {
@@ -735,6 +768,27 @@ impl AppState {
                             branch,
                         }
                     }
+                    "xiaojincut" => {
+                        let task_type_key = format!("{}_TASK_TYPE", prefix);
+                        let input_path_key = format!("{}_INPUT_PATH", prefix);
+                        let output_dir_key = format!("{}_OUTPUT_DIR", prefix);
+                        let prompt_key = format!("{}_PROMPT", prefix);
+                        let port_key = format!("{}_PORT", prefix);
+
+                        let task_type = env::var(&task_type_key).unwrap_or_else(|_| "import".to_string());
+                        let input_path = env::var(&input_path_key).ok();
+                        let output_dir = env::var(&output_dir_key).ok();
+                        let prompt = env::var(&prompt_key).ok();
+                        let port = env::var(&port_key).ok().and_then(|p| p.parse().ok());
+
+                        DeployType::Xiaojincut {
+                            task_type,
+                            input_path,
+                            output_dir,
+                            prompt,
+                            port,
+                        }
+                    }
                     _ => {
                         let script_key = format!("{}_SCRIPT", prefix);
                         let script = env::var(&script_key).unwrap_or_else(|_| "./deploy.sh".to_string());
@@ -1128,6 +1182,27 @@ async fn trigger_deploy(
                 )
                 .await;
             }
+            DeployType::Xiaojincut {
+                task_type,
+                input_path,
+                output_dir,
+                prompt,
+                port,
+            } => {
+                run_xiaojincut_task(
+                    state_clone,
+                    task_id_clone,
+                    project_clone,
+                    task_type,
+                    input_path,
+                    output_dir,
+                    prompt,
+                    port,
+                    log_tx,
+                    cancel_token,
+                )
+                .await;
+            }
         }
     });
 
@@ -1280,27 +1355,38 @@ async fn run_deploy(
     let task_id_stdout = task_id.clone();
     let task_id_stderr = task_id.clone();
 
-    // 过滤不重要的日志行
+    // 过滤不重要的日志行 - 保留更多有用信息
     fn should_send_to_center(line: &str) -> bool {
         let line = line.trim();
         // 过滤空行
         if line.is_empty() {
             return false;
         }
-        // Docker buildx 输出 - 保留关键信息
+        // Docker buildx 输出 - 更宽松地保留信息
         if line.starts_with('#') && line.chars().nth(1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
-            // 保留: DONE, ERROR, Compiling, Building, 阶段名称
+            // 保留: 阶段完成状态、编译信息、错误、关键阶段
             return line.contains("DONE")
+                || line.contains("CACHED")
                 || line.contains("ERROR")
                 || line.contains("error:")
+                || line.contains("warning:")
                 || line.contains("Compiling")
                 || line.contains("Building")
+                || line.contains("Downloading")
+                || line.contains("Downloaded")
                 || line.contains("[stage")
                 || line.contains("[builder")
-                || line.contains("FROM");
+                || line.contains("FROM")
+                || line.contains("RUN")
+                || line.contains("COPY")
+                || line.contains("exporting");
         }
         // 过滤重复的 resolve/sha256 行
-        if line.contains("sha256:") && line.contains("resolve") {
+        if line.contains("sha256:") && (line.contains("resolve") || line.contains("Pulling") || line.contains("Waiting")) {
+            return false;
+        }
+        // 过滤 buildx 进度条
+        if line.contains("[>") || line.contains("[ ") || line.contains("[=") {
             return false;
         }
         true
@@ -2372,6 +2458,214 @@ async fn get_task_status(
     })?;
 
     Ok(Json(task.clone()))
+}
+
+/// 执行 Xiaojincut 本地视频处理任务
+async fn run_xiaojincut_task(
+    state: Arc<AppState>,
+    task_id: String,
+    project: String,
+    task_type: String,
+    input_path: Option<String>,
+    output_dir: Option<String>,
+    prompt: Option<String>,
+    port: Option<u16>,
+    log_tx: broadcast::Sender<LogLine>,
+    cancel_token: CancellationToken,
+) {
+    let port = port.unwrap_or(19527);
+    let base_url = format!("http://localhost:{}/api", port);
+    let http_client = reqwest::Client::new();
+    let callback_url = state.callback_url.clone();
+    let task_id_for_log = task_id.clone();
+
+    // 辅助宏：发送日志
+    macro_rules! log_line {
+        ($stream:expr, $content:expr) => {{
+            let content = $content;
+            let _ = log_tx.send(LogLine {
+                timestamp: chrono::Utc::now(),
+                stream: $stream.to_string(),
+                content: content.clone(),
+            });
+            // 发送到 deploy-center
+            if let Some(ref url) = callback_url {
+                let http_client = http_client.clone();
+                let url = url.clone();
+                let task_id = task_id_for_log.clone();
+                tokio::spawn(async move {
+                    let append_url = format!("{}/api/deploy/logs/{}/append", url, task_id);
+                    let _ = http_client
+                        .post(&append_url)
+                        .json(&serde_json::json!({
+                            "line": content,
+                            "stream": $stream
+                        }))
+                        .send()
+                        .await;
+                });
+            }
+        }};
+    }
+
+    log_line!("stdout", format!("═══════════════════════════════════════════════════════════"));
+    log_line!("stdout", format!("Xiaojincut Task: {}", task_type));
+    log_line!("stdout", format!("═══════════════════════════════════════════════════════════"));
+    log_line!("stdout", format!("Target: http://localhost:{}", port));
+    if let Some(ref path) = input_path {
+        log_line!("stdout", format!("Input: {}", path));
+    }
+    if let Some(ref dir) = output_dir {
+        log_line!("stdout", format!("Output Dir: {}", dir));
+    }
+    if let Some(ref p) = prompt {
+        log_line!("stdout", format!("Prompt: {}", p));
+    }
+    log_line!("stdout", "───────────────────────────────────────────────────────────".to_string());
+
+    // 检查 xiaojincut 服务是否运行
+    log_line!("stdout", ">>> Checking xiaojincut service health...".to_string());
+
+    let health_url = format!("{}/health", base_url);
+    let health_result = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            log_line!("stderr", "Task cancelled".to_string());
+            update_task_status(&state, &task_id, DeployStatus::Failed, Some(-1)).await;
+            return;
+        }
+        result = http_client.get(&health_url).timeout(std::time::Duration::from_secs(5)).send() => result
+    };
+
+    match health_result {
+        Ok(resp) if resp.status().is_success() => {
+            log_line!("stdout", "✅ xiaojincut service is running".to_string());
+        }
+        Ok(resp) => {
+            log_line!("stderr", format!("❌ xiaojincut health check failed: HTTP {}", resp.status()));
+            update_task_status(&state, &task_id, DeployStatus::Failed, Some(1)).await;
+            if let Some(ref url) = state.callback_url {
+                let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Failed, 1).await;
+            }
+            return;
+        }
+        Err(e) => {
+            log_line!("stderr", format!("❌ xiaojincut service not reachable: {}", e));
+            log_line!("stderr", "Tip: Start xiaojincut with: open /Applications/xiaojincut.app".to_string());
+            update_task_status(&state, &task_id, DeployStatus::Failed, Some(1)).await;
+            if let Some(ref url) = state.callback_url {
+                let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Failed, 1).await;
+            }
+            return;
+        }
+    }
+
+    // 根据任务类型执行不同操作
+    let result = match task_type.as_str() {
+        "import" => {
+            if let Some(path) = input_path {
+                log_line!("stdout", format!(">>> Importing media: {}", path));
+                let import_url = format!("{}/import", base_url);
+                http_client
+                    .post(&import_url)
+                    .json(&serde_json::json!({ "path": path }))
+                    .timeout(std::time::Duration::from_secs(60))
+                    .send()
+                    .await
+            } else {
+                log_line!("stderr", "❌ Missing input_path for import task".to_string());
+                update_task_status(&state, &task_id, DeployStatus::Failed, Some(1)).await;
+                if let Some(ref url) = state.callback_url {
+                    let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Failed, 1).await;
+                }
+                return;
+            }
+        }
+        "export" => {
+            log_line!("stdout", ">>> Exporting timeline...".to_string());
+            let export_url = format!("{}/export", base_url);
+            let mut payload = serde_json::json!({});
+            if let Some(dir) = output_dir {
+                payload["output_dir"] = serde_json::Value::String(dir);
+            }
+            http_client
+                .post(&export_url)
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(300))
+                .send()
+                .await
+        }
+        "status" => {
+            log_line!("stdout", ">>> Getting status...".to_string());
+            let status_url = format!("{}/status", base_url);
+            http_client
+                .get(&status_url)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+        }
+        "timeline" => {
+            log_line!("stdout", ">>> Getting timeline...".to_string());
+            let timeline_url = format!("{}/timeline", base_url);
+            http_client
+                .get(&timeline_url)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+        }
+        _ => {
+            log_line!("stderr", format!("❌ Unknown task type: {}", task_type));
+            update_task_status(&state, &task_id, DeployStatus::Failed, Some(1)).await;
+            if let Some(ref url) = state.callback_url {
+                let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Failed, 1).await;
+            }
+            return;
+        }
+    };
+
+    // 处理响应
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_else(|_| "".to_string());
+
+            if status.is_success() {
+                log_line!("stdout", "───────────────────────────────────────────────────────────".to_string());
+                log_line!("stdout", format!("✅ Task completed successfully"));
+
+                // 尝试格式化 JSON 输出
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    let pretty = serde_json::to_string_pretty(&json).unwrap_or(body.clone());
+                    for line in pretty.lines() {
+                        log_line!("stdout", line.to_string());
+                    }
+                } else if !body.is_empty() {
+                    log_line!("stdout", body);
+                }
+
+                log_line!("stdout", "═══════════════════════════════════════════════════════════".to_string());
+                update_task_status(&state, &task_id, DeployStatus::Success, Some(0)).await;
+                if let Some(ref url) = state.callback_url {
+                    let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Success, 0).await;
+                }
+            } else {
+                log_line!("stderr", format!("❌ Task failed: HTTP {}", status));
+                if !body.is_empty() {
+                    log_line!("stderr", body);
+                }
+                update_task_status(&state, &task_id, DeployStatus::Failed, Some(1)).await;
+                if let Some(ref url) = state.callback_url {
+                    let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Failed, 1).await;
+                }
+            }
+        }
+        Err(e) => {
+            log_line!("stderr", format!("❌ Request failed: {}", e));
+            update_task_status(&state, &task_id, DeployStatus::Failed, Some(1)).await;
+            if let Some(ref url) = state.callback_url {
+                let _ = notify_deploy_center(url, &task_id, &project, &DeployStatus::Failed, 1).await;
+            }
+        }
+    }
 }
 
 /// 流式获取日志
