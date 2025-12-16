@@ -15,14 +15,23 @@ services:
       - DEPLOY_AGENT_API_KEY=${DEPLOY_AGENT_API_KEY:-change-me-in-production}
       # 回调 URL（可选）
       - DEPLOY_CENTER_CALLBACK_URL=https://auth.xiaojinpro.com
+      # 数据库凭证（用于 /db/* 端点）
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres123
+      - MYSQL_USER=root
+      - MYSQL_ROOT_PASSWORD=mysql123
       # 项目配置
       - BACKEND_WORK_DIR=/workspace/xiaojinpro-backend
+      # GCP VM SSH 配置（构建完成后自动触发拉取重启）
+      - GCP_SSH_ENABLED=${GCP_SSH_ENABLED:-false}
+      - GCP_VM_IP=${GCP_VM_IP:-34.104.147.118}
+      - GCP_VM_USER=${GCP_VM_USER:-jinchen}
     volumes:
       # 挂载工作目录
       - /root/xiaojinpro-backend:/workspace/xiaojinpro-backend
       # 挂载 Docker socket 以便执行 docker 命令
       - /var/run/docker.sock:/var/run/docker.sock
-      # 挂载 SSH 密钥（如果需要 git 操作）
+      # 挂载 SSH 密钥（用于 git 和 GCP SSH）
       - ~/.ssh:/root/.ssh:ro
       # 挂载 GHCR 认证
       - ~/.docker/config.json:/root/.docker/config.json:ro
