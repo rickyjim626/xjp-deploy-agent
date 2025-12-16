@@ -1905,6 +1905,113 @@ async fn run_docker_compose_deploy(
     );
 }
 
+/// 清理僵尸 docker 进程和卡住的 docker build 进程
+/// 在每次开始新的 docker build 之前调用，避免僵尸进程影响新的构建
+async fn cleanup_zombie_docker_processes() -> (usize, usize) {
+    let mut zombies_killed = 0;
+    let mut hung_builds_killed = 0;
+
+    // 1. 检查僵尸进程 (状态为 Z 或包含 <defunct>)
+    if let Ok(output) = Command::new("ps")
+        .args(["aux"])
+        .output()
+        .await
+    {
+        let ps_output = String::from_utf8_lossy(&output.stdout);
+        for line in ps_output.lines() {
+            // 检查是否是 docker 相关的僵尸进程
+            if (line.contains("docker") || line.contains("buildkit"))
+                && (line.contains("<defunct>") || line.contains(" Z ") || line.contains(" Z+ "))
+            {
+                // 提取 PID (第二列)
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(pid) = parts[1].parse::<i32>() {
+                        info!("Found zombie docker process: PID={}, killing...", pid);
+                        if let Ok(_) = Command::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .output()
+                            .await
+                        {
+                            zombies_killed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 检查长时间运行的 docker build 进程 (超过30分钟)
+    if let Ok(output) = Command::new("ps")
+        .args(["-eo", "pid,etimes,args"])
+        .output()
+        .await
+    {
+        let ps_output = String::from_utf8_lossy(&output.stdout);
+        for line in ps_output.lines().skip(1) {
+            // 跳过标题行
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let pid = parts[0];
+                let elapsed_secs: i64 = parts[1].parse().unwrap_or(0);
+                let cmd = parts[2..].join(" ");
+
+                // 超过30分钟(1800秒)的 docker build 进程
+                if elapsed_secs > 1800
+                    && (cmd.contains("docker build") || cmd.contains("docker-buildx"))
+                {
+                    info!(
+                        "Found hung docker build process: PID={}, running for {}s, killing...",
+                        pid, elapsed_secs
+                    );
+                    if let Ok(_) = Command::new("kill")
+                        .args(["-9", pid])
+                        .output()
+                        .await
+                    {
+                        hung_builds_killed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 清理孤立的 buildkit 进程
+    if let Ok(output) = Command::new("pgrep")
+        .args(["-f", "buildkit"])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid in pids.lines() {
+                if !pid.trim().is_empty() {
+                    // 检查这个进程的父进程是否是 init (PID 1)，表示是孤儿进程
+                    if let Ok(ppid_output) = Command::new("ps")
+                        .args(["-o", "ppid=", "-p", pid.trim()])
+                        .output()
+                        .await
+                    {
+                        let ppid = String::from_utf8_lossy(&ppid_output.stdout)
+                            .trim()
+                            .to_string();
+                        if ppid == "1" {
+                            info!("Found orphan buildkit process: PID={}, killing...", pid.trim());
+                            let _ = Command::new("kill")
+                                .args(["-9", pid.trim()])
+                                .output()
+                                .await;
+                            hung_builds_killed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (zombies_killed, hung_builds_killed)
+}
+
 /// Docker Build 部署 - 拉取代码、构建镜像、推送到 registry
 #[allow(clippy::too_many_arguments)]
 async fn run_docker_build_deploy(
@@ -2078,6 +2185,13 @@ async fn run_docker_build_deploy(
     // Stage 2: Docker Build
     // ============================================
     if exit_code == 0 {
+        // 清理僵尸进程和卡住的 docker build 进程
+        log_line!("stdout", "Checking for zombie docker processes...".to_string());
+        let (zombies, hung) = cleanup_zombie_docker_processes().await;
+        if zombies > 0 || hung > 0 {
+            log_line!("stdout", format!("Cleaned up {} zombie and {} hung docker processes", zombies, hung));
+        }
+
         stages[1].start();
         send_stage_update(stages.clone());
 
@@ -2088,6 +2202,7 @@ async fn run_docker_build_deploy(
         let build_result = Command::new("docker")
             .args([
                 "build",
+                "--progress=plain",  // 使用 plain 格式以便流式输出日志
                 "-t", &full_image,
                 "-f", dockerfile_path,
                 context_path,
@@ -2099,14 +2214,77 @@ async fn run_docker_build_deploy(
 
         match build_result {
             Ok(mut child) => {
-                // 流式读取构建输出
-                if let Some(stdout) = child.stdout.take() {
-                    let reader = BufReader::new(stdout);
-                    let mut lines = reader.lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        log_line!("stdout", line);
+                // 流式读取构建输出 - BuildKit 输出到 stderr
+                let stderr = child.stderr.take();
+                let stdout = child.stdout.take();
+
+                // 并发读取 stdout 和 stderr
+                let stderr_task = tokio::spawn({
+                    let log_tx = log_tx.clone();
+                    let http_client = http_client.clone();
+                    let callback_url = callback_url.clone();
+                    let task_id = task_id.clone();
+                    async move {
+                        if let Some(stderr) = stderr {
+                            let reader = BufReader::new(stderr);
+                            let mut lines = reader.lines();
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                // 发送到本地日志
+                                let _ = log_tx.send(LogLine {
+                                    timestamp: chrono::Utc::now(),
+                                    stream: "stderr".to_string(),
+                                    content: line.clone(),
+                                });
+                                // 发送到 deploy-center (BuildKit 输出在这里)
+                                if let Some(ref url) = callback_url {
+                                    let append_url = format!("{}/api/deploy/logs/{}/append", url, task_id);
+                                    let _ = http_client
+                                        .post(&append_url)
+                                        .json(&serde_json::json!({
+                                            "line": line,
+                                            "stream": "stderr"
+                                        }))
+                                        .send()
+                                        .await;
+                                }
+                            }
+                        }
                     }
-                }
+                });
+
+                let stdout_task = tokio::spawn({
+                    let log_tx = log_tx.clone();
+                    let http_client = http_client.clone();
+                    let callback_url = callback_url.clone();
+                    let task_id = task_id.clone();
+                    async move {
+                        if let Some(stdout) = stdout {
+                            let reader = BufReader::new(stdout);
+                            let mut lines = reader.lines();
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                let _ = log_tx.send(LogLine {
+                                    timestamp: chrono::Utc::now(),
+                                    stream: "stdout".to_string(),
+                                    content: line.clone(),
+                                });
+                                if let Some(ref url) = callback_url {
+                                    let append_url = format!("{}/api/deploy/logs/{}/append", url, task_id);
+                                    let _ = http_client
+                                        .post(&append_url)
+                                        .json(&serde_json::json!({
+                                            "line": line,
+                                            "stream": "stdout"
+                                        }))
+                                        .send()
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 等待输出读取完成
+                let _ = tokio::join!(stderr_task, stdout_task);
 
                 match child.wait().await {
                     Ok(exit_status) => {
