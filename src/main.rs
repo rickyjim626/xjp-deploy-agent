@@ -1479,6 +1479,28 @@ async fn run_docker_compose_deploy(
         }
     };
 
+    // 发送 stages 更新到 deploy-center
+    let send_stage_update = {
+        let http_client = http_client.clone();
+        let callback_url = callback_url.clone();
+        let task_id = task_id_for_log.clone();
+        move |stages: Vec<DeployStage>| {
+            let http_client = http_client.clone();
+            let callback_url = callback_url.clone();
+            let task_id = task_id.clone();
+            tokio::spawn(async move {
+                if let Some(ref url) = callback_url {
+                    let stage_url = format!("{}/api/deploy/logs/{}/stages", url, task_id);
+                    let _ = http_client
+                        .post(&stage_url)
+                        .json(&serde_json::json!({ "stages": stages }))
+                        .send()
+                        .await;
+                }
+            });
+        }
+    };
+
     // 辅助宏：同时发送到本地广播和 deploy-center
     macro_rules! log_line {
         ($stream:expr, $content:expr) => {{
@@ -1491,6 +1513,14 @@ async fn run_docker_compose_deploy(
             send_log_to_center($stream.to_string(), content);
         }};
     }
+
+    // 初始化阶段
+    let mut stages = vec![
+        DeployStage::new("git_pull", "Git Pull"),
+        DeployStage::new("docker_pull", "Docker Pull"),
+        DeployStage::new("compose_pull", "Compose Pull"),
+        DeployStage::new("compose_up", "Compose Up"),
+    ];
 
     log_line!("stdout", format!("=== Docker Compose Deploy for {} ===", project));
     log_line!("stdout", format!("Working directory: {}", work_dir));
@@ -1523,6 +1553,8 @@ async fn run_docker_compose_deploy(
     log_line!("stdout", format!("Using: {} {:?}", docker_compose_cmd, docker_compose_args));
 
     // Step 1: Git pull (如果配置了 git_repo_dir)
+    stages[0].start();
+    send_stage_update(stages.clone());
     if let Some(ref git_dir) = git_repo_dir {
         log_line!("stdout", "[1/4] Updating repository...".to_string());
         log_line!("stdout", format!(">>> git pull (in {})", git_dir));
@@ -1541,17 +1573,23 @@ async fn run_docker_compose_deploy(
                 if !output.stderr.is_empty() {
                     log_line!("stderr", String::from_utf8_lossy(&output.stderr).to_string());
                 }
-                if !output.status.success() {
+                if output.status.success() {
+                    stages[0].finish(true, None);
+                } else {
+                    stages[0].finish(false, Some("git pull failed, continuing".to_string()));
                     log_line!("stderr", "Warning: git pull failed, continuing with existing files".to_string());
                 }
             }
             Err(e) => {
+                stages[0].finish(false, Some(e.to_string()));
                 log_line!("stderr", format!("Warning: Failed to run git pull: {}", e));
             }
         }
     } else {
+        stages[0].skip(Some("not configured".to_string()));
         log_line!("stdout", "[1/4] Skipping git pull (not configured)".to_string());
     }
+    send_stage_update(stages.clone());
 
     // 检查是否被取消
     if cancel_token.is_cancelled() {
@@ -1562,6 +1600,8 @@ async fn run_docker_compose_deploy(
 
     // Step 2: Docker pull image
     if exit_code == 0 {
+        stages[1].start();
+        send_stage_update(stages.clone());
         log_line!("stdout", "[2/4] Pulling Docker image...".to_string());
         log_line!("stdout", format!(">>> docker pull {}", image));
 
@@ -1578,18 +1618,23 @@ async fn run_docker_compose_deploy(
                 if !output.stderr.is_empty() {
                     log_line!("stderr", String::from_utf8_lossy(&output.stderr).to_string());
                 }
-                if !output.status.success() {
+                if output.status.success() {
+                    stages[1].finish(true, None);
+                } else {
+                    stages[1].finish(false, Some("docker pull failed".to_string()));
                     log_line!("stderr", "Error: Failed to pull image".to_string());
                     status = DeployStatus::Failed;
                     exit_code = output.status.code().unwrap_or(-1);
                 }
             }
             Err(e) => {
+                stages[1].finish(false, Some(e.to_string()));
                 log_line!("stderr", format!("Error: Failed to run docker pull: {}", e));
                 status = DeployStatus::Failed;
                 exit_code = -1;
             }
         }
+        send_stage_update(stages.clone());
     }
 
     // 检查是否被取消
@@ -1601,6 +1646,8 @@ async fn run_docker_compose_deploy(
 
     // Step 3: Docker compose pull (确保服务镜像更新)
     if exit_code == 0 {
+        stages[2].start();
+        send_stage_update(stages.clone());
         let service_str = service.as_deref().unwrap_or("all services");
         log_line!("stdout", format!("[3/4] Pulling {}...", service_str));
 
@@ -1628,18 +1675,25 @@ async fn run_docker_compose_deploy(
                     // compose pull 的进度信息通常在 stderr
                     log_line!("stdout", String::from_utf8_lossy(&output.stderr).to_string());
                 }
-                if !output.status.success() {
+                if output.status.success() {
+                    stages[2].finish(true, None);
+                } else {
+                    stages[2].finish(false, Some("compose pull had issues".to_string()));
                     log_line!("stderr", "Warning: compose pull had issues, continuing...".to_string());
                 }
             }
             Err(e) => {
+                stages[2].finish(false, Some(e.to_string()));
                 log_line!("stderr", format!("Warning: Failed to run compose pull: {}", e));
             }
         }
+        send_stage_update(stages.clone());
     }
 
     // Step 4: Docker compose up -d --force-recreate
     if exit_code == 0 {
+        stages[3].start();
+        send_stage_update(stages.clone());
         let service_str = service.as_deref().unwrap_or("all services");
         log_line!("stdout", format!("[4/4] Restarting {}...", service_str));
 
@@ -1666,18 +1720,23 @@ async fn run_docker_compose_deploy(
                 if !output.stderr.is_empty() {
                     log_line!("stdout", String::from_utf8_lossy(&output.stderr).to_string());
                 }
-                if !output.status.success() {
+                if output.status.success() {
+                    stages[3].finish(true, None);
+                } else {
+                    stages[3].finish(false, Some("compose up failed".to_string()));
                     log_line!("stderr", "Error: Failed to start services".to_string());
                     status = DeployStatus::Failed;
                     exit_code = output.status.code().unwrap_or(-1);
                 }
             }
             Err(e) => {
+                stages[3].finish(false, Some(e.to_string()));
                 log_line!("stderr", format!("Error: Failed to run compose up: {}", e));
                 status = DeployStatus::Failed;
                 exit_code = -1;
             }
         }
+        send_stage_update(stages.clone());
     }
 
     // 显示最终状态
@@ -1719,6 +1778,21 @@ async fn run_docker_compose_deploy(
         }
     }
 
+    // 打印 Stage Summary
+    log_line!("stdout", "".to_string());
+    log_line!("stdout", "=== Stage Summary ===".to_string());
+    for stage in &stages {
+        let duration = stage.duration_ms.map(|d| format!("{}ms", d)).unwrap_or_else(|| "-".to_string());
+        let status_icon = match stage.status {
+            StageStatus::Success => "✓",
+            StageStatus::Failed => "✗",
+            StageStatus::Skipped => "⊘",
+            StageStatus::Running => "⟳",
+            StageStatus::Pending => "○",
+        };
+        log_line!("stdout", format!("{} {} ({})", status_icon, stage.display_name, duration));
+    }
+
     // 从 running_deploys 中移除
     {
         let mut running = state.running_deploys.write().await;
@@ -1732,9 +1806,9 @@ async fn run_docker_compose_deploy(
     // 更新任务状态
     update_task_status(&state, &task_id, status.clone(), Some(exit_code)).await;
 
-    // 回调通知部署中心
+    // 回调通知部署中心（带 stages）
     if let Some(ref callback_url) = state.callback_url {
-        let _ = notify_deploy_center(callback_url, &task_id, &project, &status, exit_code).await;
+        let _ = notify_deploy_center_with_stages(callback_url, &task_id, &project, &status, exit_code, &stages).await;
     }
 
     info!(
