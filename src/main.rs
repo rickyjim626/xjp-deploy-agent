@@ -2235,17 +2235,22 @@ async fn run_docker_build_deploy(
                                     stream: "stderr".to_string(),
                                     content: line.clone(),
                                 });
-                                // 发送到 deploy-center (BuildKit 输出在这里)
+                                // 异步发送到 deploy-center，不阻塞管道读取（避免反压导致构建变慢）
                                 if let Some(ref url) = callback_url {
                                     let append_url = format!("{}/api/deploy/logs/{}/append", url, task_id);
-                                    let _ = http_client
-                                        .post(&append_url)
-                                        .json(&serde_json::json!({
-                                            "line": line,
-                                            "stream": "stderr"
-                                        }))
-                                        .send()
-                                        .await;
+                                    let client = http_client.clone();
+                                    let body = serde_json::json!({
+                                        "line": line,
+                                        "stream": "stderr"
+                                    });
+                                    tokio::spawn(async move {
+                                        let _ = client
+                                            .post(&append_url)
+                                            .json(&body)
+                                            .timeout(std::time::Duration::from_secs(3))
+                                            .send()
+                                            .await;
+                                    });
                                 }
                             }
                         }
@@ -2267,16 +2272,22 @@ async fn run_docker_build_deploy(
                                     stream: "stdout".to_string(),
                                     content: line.clone(),
                                 });
+                                // 异步发送到 deploy-center，不阻塞管道读取
                                 if let Some(ref url) = callback_url {
                                     let append_url = format!("{}/api/deploy/logs/{}/append", url, task_id);
-                                    let _ = http_client
-                                        .post(&append_url)
-                                        .json(&serde_json::json!({
-                                            "line": line,
-                                            "stream": "stdout"
-                                        }))
-                                        .send()
-                                        .await;
+                                    let client = http_client.clone();
+                                    let body = serde_json::json!({
+                                        "line": line,
+                                        "stream": "stdout"
+                                    });
+                                    tokio::spawn(async move {
+                                        let _ = client
+                                            .post(&append_url)
+                                            .json(&body)
+                                            .timeout(std::time::Duration::from_secs(3))
+                                            .send()
+                                            .await;
+                                    });
                                 }
                             }
                         }

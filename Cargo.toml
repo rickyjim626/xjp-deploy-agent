@@ -1,6 +1,6 @@
 [package]
 name = "xjp-deploy-agent"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Deploy agent for private cloud - triggers builds and streams logs"
 
