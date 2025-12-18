@@ -1,0 +1,185 @@
+//! 应用状态
+
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::{
+    autoupdate::{AutoUpdateConfig, AutoUpdateState},
+    env::EnvConfig,
+    project::{load_projects_from_env, ProjectConfig},
+};
+use crate::domain::tunnel::{PortMapping, TunnelClientState, TunnelMode, TunnelServerState};
+use crate::infra::DeployCenterClient;
+use crate::state::{LogHub, TaskStore};
+
+/// 运行中的部署进程信息
+pub struct RunningDeploy {
+    pub task_id: String,
+    pub cancel_token: CancellationToken,
+}
+
+/// 应用状态
+pub struct AppState {
+    // ========== 核心配置 ==========
+    /// API 密钥（用于验证请求）
+    pub api_key: String,
+    /// 环境配置
+    pub config: EnvConfig,
+    /// 项目配置
+    pub projects: HashMap<String, ProjectConfig>,
+    /// 服务启动时间
+    pub started_at: DateTime<Utc>,
+
+    // ========== 任务管理 ==========
+    /// 任务存储
+    pub task_store: TaskStore,
+    /// 日志中心
+    pub log_hub: LogHub,
+    /// 每个项目当前运行中的部署 (project -> RunningDeploy)
+    pub running_deploys: RwLock<HashMap<String, RunningDeploy>>,
+
+    // ========== 外部服务 ==========
+    /// 部署中心客户端
+    pub deploy_center: DeployCenterClient,
+
+    // ========== 隧道相关 ==========
+    /// 隧道模式
+    pub tunnel_mode: TunnelMode,
+    /// 隧道认证令牌
+    pub tunnel_auth_token: String,
+    /// 隧道服务端状态 (仅 Server 模式)
+    pub tunnel_server_state: Arc<TunnelServerState>,
+    /// 隧道客户端状态 (仅 Client 模式)
+    pub tunnel_client_state: Arc<TunnelClientState>,
+    /// 端口映射配置 (Client 模式)
+    pub tunnel_port_mappings: Vec<PortMapping>,
+    /// 隧道服务端 URL (Client 模式)
+    pub tunnel_server_url: String,
+
+    // ========== 自动更新 ==========
+    /// 自动更新配置
+    pub auto_update_config: Option<AutoUpdateConfig>,
+    /// 自动更新状态
+    pub auto_update_state: Arc<AutoUpdateState>,
+}
+
+impl AppState {
+    /// 创建新的应用状态
+    pub fn new() -> Self {
+        let config = EnvConfig::from_env();
+        let projects = load_projects_from_env();
+
+        tracing::info!(
+            api_key_len = config.api_key.len(),
+            callback_url = ?config.callback_url,
+            port = config.port,
+            tunnel_mode = ?config.tunnel.mode,
+            auto_update = config.auto_update.is_some(),
+            project_count = projects.len(),
+            "Loaded configuration"
+        );
+
+        for (name, project) in &projects {
+            tracing::info!(
+                project = %name,
+                work_dir = %project.work_dir,
+                deploy_type = %project.deploy_type.name(),
+                "Registered project"
+            );
+        }
+
+        Self {
+            api_key: config.api_key.clone(),
+            projects,
+            started_at: Utc::now(),
+
+            task_store: TaskStore::new(),
+            log_hub: LogHub::new(),
+            running_deploys: RwLock::new(HashMap::new()),
+
+            deploy_center: DeployCenterClient::new(config.callback_url.clone()),
+
+            tunnel_mode: config.tunnel.mode.clone(),
+            tunnel_auth_token: config.tunnel.auth_token.clone(),
+            tunnel_server_state: Arc::new(TunnelServerState::new()),
+            tunnel_client_state: Arc::new(TunnelClientState::new()),
+            tunnel_port_mappings: config.tunnel.port_mappings.clone(),
+            tunnel_server_url: config.tunnel.server_url.clone(),
+
+            auto_update_config: config.auto_update.clone(),
+            auto_update_state: Arc::new(AutoUpdateState::new()),
+
+            config,
+        }
+    }
+
+    /// 验证 API Key
+    pub fn verify_api_key(&self, headers: &axum::http::HeaderMap) -> bool {
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |key| key == self.api_key)
+    }
+
+    /// 获取项目配置
+    pub fn get_project(&self, name: &str) -> Option<&ProjectConfig> {
+        self.projects.get(name)
+    }
+
+    /// 检查项目是否有正在运行的部署
+    pub async fn has_running_deploy(&self, project: &str) -> bool {
+        let running = self.running_deploys.read().await;
+        running.contains_key(project)
+    }
+
+    /// 注册运行中的部署
+    pub async fn register_running_deploy(&self, project: &str, task_id: &str) -> CancellationToken {
+        let cancel_token = CancellationToken::new();
+        let mut running = self.running_deploys.write().await;
+        running.insert(
+            project.to_string(),
+            RunningDeploy {
+                task_id: task_id.to_string(),
+                cancel_token: cancel_token.clone(),
+            },
+        );
+        cancel_token
+    }
+
+    /// 取消注册运行中的部署
+    pub async fn unregister_running_deploy(&self, project: &str) {
+        let mut running = self.running_deploys.write().await;
+        running.remove(project);
+    }
+
+    /// 获取运行中的部署任务 ID
+    pub async fn get_running_deploy_task_id(&self, project: &str) -> Option<String> {
+        let running = self.running_deploys.read().await;
+        running.get(project).map(|d| d.task_id.clone())
+    }
+
+    /// 取消项目的部署
+    pub async fn cancel_deploy(&self, project: &str) -> bool {
+        let running = self.running_deploys.read().await;
+        if let Some(deploy) = running.get(project) {
+            deploy.cancel_token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 获取回调 URL
+    pub fn callback_url(&self) -> Option<&str> {
+        self.config.callback_url.as_deref()
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

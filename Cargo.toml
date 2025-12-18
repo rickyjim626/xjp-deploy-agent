@@ -1,18 +1,22 @@
 [package]
 name = "xjp-deploy-agent"
-version = "0.6.0"
+version = "0.6.5"
 edition = "2021"
 description = "Deploy agent for private cloud - triggers builds and streams logs"
 
 [dependencies]
 # Web framework
-axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "net"] }
+
+# WebSocket client (for tunnel client mode)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = "1.3"
 
 # Async utilities
 futures = "0.3"
@@ -26,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+url = "2"
 
 # HTTP client (for callback)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -35,3 +40,7 @@ async-stream = "0.3"
 
 # System information
 sysinfo = "0.32"
+
+# SHA256 for update verification
+sha2 = "0.10"
+hex = "0.4"

@@ -3,7 +3,10 @@
 //! 运行在私有云上，接收部署中心的触发请求，执行构建脚本并流式传输日志。
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -23,10 +26,14 @@ use std::{
 };
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
     process::Command,
-    sync::{broadcast, RwLock},
+    sync::{broadcast, mpsc, RwLock},
+    time::Duration,
 };
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as TungsteniteMessage};
+use futures::{SinkExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
@@ -646,6 +653,298 @@ pub struct DbExportResponse {
 
 // ============== 数据库管理结束 ==============
 
+// ============== 隧道 (FRP) 相关结构 ==============
+
+/// 隧道运行模式
+#[derive(Clone, Debug, PartialEq)]
+pub enum TunnelMode {
+    /// 服务端模式 (ECS): 接收隧道连接，暴露远程服务
+    Server,
+    /// 客户端模式 (私有云): 主动连接服务端，转发本地服务
+    Client,
+    /// 禁用隧道
+    Disabled,
+}
+
+impl TunnelMode {
+    fn from_env() -> Self {
+        match env::var("TUNNEL_MODE").as_deref() {
+            Ok("server") => TunnelMode::Server,
+            Ok("client") => TunnelMode::Client,
+            _ => TunnelMode::Disabled,
+        }
+    }
+}
+
+/// 端口映射配置
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PortMapping {
+    /// 远程端口 (在 ECS 上暴露)
+    pub remote_port: u16,
+    /// 本地主机
+    pub local_host: String,
+    /// 本地端口
+    pub local_port: u16,
+    /// 服务名称 (如 "minio", "postgres")
+    pub name: String,
+}
+
+impl PortMapping {
+    /// 从环境变量解析端口映射
+    /// 格式: "name:remote_port:local_host:local_port,..."
+    /// 例如: "minio:19000:localhost:9000,postgres:15432:localhost:5432"
+    fn from_env() -> Vec<Self> {
+        let mappings_str = env::var("TUNNEL_MAPPINGS").unwrap_or_default();
+        mappings_str
+            .split(',')
+            .filter_map(|s| {
+                let parts: Vec<&str> = s.trim().split(':').collect();
+                if parts.len() == 4 {
+                    Some(PortMapping {
+                        name: parts[0].to_string(),
+                        remote_port: parts[1].parse().ok()?,
+                        local_host: parts[2].to_string(),
+                        local_port: parts[3].parse().ok()?,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// 隧道协议消息
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TunnelMessage {
+    /// 客户端发送端口映射配置
+    Config { mappings: Vec<PortMapping> },
+    /// 新连接请求 (Server -> Client)
+    Connect { conn_id: String, remote_port: u16 },
+    /// 连接已建立 (Client -> Server)
+    Connected { conn_id: String },
+    /// 连接失败 (Client -> Server)
+    ConnectFailed { conn_id: String, error: String },
+    /// 数据传输
+    Data { conn_id: String, data: Vec<u8> },
+    /// 连接关闭
+    Close { conn_id: String },
+    /// 心跳
+    Ping,
+    Pong,
+}
+
+/// 隧道连接信息 (用于 API 响应)
+#[derive(Clone, Debug, Serialize)]
+pub struct TunnelConnectionInfo {
+    pub id: String,
+    pub connected_at: chrono::DateTime<chrono::Utc>,
+    pub remote_addr: String,
+    pub mappings: Vec<PortMapping>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+/// 端口映射状态信息
+#[derive(Clone, Debug, Serialize)]
+pub struct PortMappingStatus {
+    pub mapping: PortMapping,
+    pub status: String, // "active", "listening", "error"
+    pub active_connections: usize,
+}
+
+/// 客户端连接状态
+#[derive(Clone, Debug, Serialize)]
+pub struct TunnelClientStatus {
+    pub connected: bool,
+    pub server_url: String,
+    pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub reconnect_count: u32,
+    pub mappings: Vec<PortMappingStatus>,
+}
+
+/// 服务端状态
+#[derive(Clone, Debug, Serialize)]
+pub struct TunnelServerStatus {
+    pub listening: bool,
+    pub listen_port: u16,
+    pub client_connected: bool,
+    pub client_addr: Option<String>,
+    pub client_connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub port_mappings: Vec<PortMappingStatus>,
+}
+
+/// 隧道状态响应
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "mode")]
+pub enum TunnelStatusResponse {
+    #[serde(rename = "server")]
+    Server(TunnelServerStatus),
+    #[serde(rename = "client")]
+    Client(TunnelClientStatus),
+    #[serde(rename = "disabled")]
+    Disabled,
+}
+
+/// 隧道状态 (Server 模式)
+pub struct TunnelServerState {
+    /// 客户端 WebSocket 连接是否活跃
+    pub client_connected: RwLock<bool>,
+    /// 客户端地址
+    pub client_addr: RwLock<Option<String>>,
+    /// 客户端连接时间
+    pub client_connected_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    /// 客户端的端口映射配置
+    pub client_mappings: RwLock<Vec<PortMapping>>,
+    /// 活跃的代理连接 (conn_id -> 发送通道)
+    pub proxy_connections: RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    /// 发送消息到 WebSocket 客户端的通道
+    pub ws_tx: RwLock<Option<mpsc::Sender<TunnelMessage>>>,
+    /// 端口监听器取消令牌 (port -> cancel_token)
+    pub port_listeners: RwLock<HashMap<u16, CancellationToken>>,
+}
+
+impl TunnelServerState {
+    fn new() -> Self {
+        Self {
+            client_connected: RwLock::new(false),
+            client_addr: RwLock::new(None),
+            client_connected_at: RwLock::new(None),
+            client_mappings: RwLock::new(Vec::new()),
+            proxy_connections: RwLock::new(HashMap::new()),
+            ws_tx: RwLock::new(None),
+            port_listeners: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+/// 隧道状态 (Client 模式)
+pub struct TunnelClientState {
+    /// 是否已连接
+    pub connected: RwLock<bool>,
+    /// 连接时间
+    pub connected_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    /// 最后错误
+    pub last_error: RwLock<Option<String>>,
+    /// 重连次数
+    pub reconnect_count: RwLock<u32>,
+    /// 活跃的本地连接 (conn_id -> 发送通道)
+    pub local_connections: RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+}
+
+impl TunnelClientState {
+    fn new() -> Self {
+        Self {
+            connected: RwLock::new(false),
+            connected_at: RwLock::new(None),
+            last_error: RwLock::new(None),
+            reconnect_count: RwLock::new(0),
+            local_connections: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+// ============== 隧道结构结束 ==============
+
+// ============== 自动更新结构 ==============
+
+/// 更新元数据 (从 latest.json 解析)
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UpdateMetadata {
+    pub version: String,
+    pub released_at: String,
+    pub changelog: Option<String>,
+    pub sha256: Option<String>,
+}
+
+/// 自动更新配置
+#[derive(Clone, Debug)]
+pub struct AutoUpdateConfig {
+    /// 是否启用
+    pub enabled: bool,
+    /// 存储端点 (如 https://rickyjim.oss-cn-shanghai-internal.aliyuncs.com)
+    pub endpoint: String,
+    /// 元数据路径 (如 releases/xjp-deploy-agent/latest.json)
+    pub metadata_path: String,
+    /// 二进制路径模板 (如 releases/xjp-deploy-agent/xjp-deploy-agent-{version}-linux-musl-amd64)
+    pub binary_path_template: String,
+    /// 检查间隔（秒）
+    pub check_interval_secs: u64,
+}
+
+impl AutoUpdateConfig {
+    fn from_env() -> Option<Self> {
+        let enabled = env::var("AUTO_UPDATE_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        if !enabled {
+            return None;
+        }
+
+        let endpoint = env::var("UPDATE_ENDPOINT").ok()?;
+        let metadata_path = env::var("UPDATE_METADATA_PATH").ok()?;
+        let binary_path_template = env::var("UPDATE_BINARY_PATH_TEMPLATE").ok()?;
+        let check_interval_secs = env::var("UPDATE_CHECK_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+
+        Some(Self {
+            enabled,
+            endpoint,
+            metadata_path,
+            binary_path_template,
+            check_interval_secs,
+        })
+    }
+}
+
+/// 自动更新状态
+pub struct AutoUpdateState {
+    /// 上次检查时间
+    pub last_check: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    /// 上次检查结果
+    pub last_check_result: RwLock<Option<String>>,
+    /// 检测到的最新版本
+    pub latest_version: RwLock<Option<String>>,
+    /// 是否有可用更新
+    pub update_available: RwLock<bool>,
+    /// 更新进度 (downloading, verifying, applying, none)
+    pub update_progress: RwLock<String>,
+    /// 下一次检查时间
+    pub next_check: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl AutoUpdateState {
+    fn new() -> Self {
+        Self {
+            last_check: RwLock::new(None),
+            last_check_result: RwLock::new(None),
+            latest_version: RwLock::new(None),
+            update_available: RwLock::new(false),
+            update_progress: RwLock::new("none".to_string()),
+            next_check: RwLock::new(None),
+        }
+    }
+}
+
+/// 自动更新状态响应（用于 health 接口）
+#[derive(Clone, Debug, Serialize)]
+pub struct AutoUpdateStatus {
+    pub enabled: bool,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub last_check: Option<String>,
+    pub last_check_result: Option<String>,
+    pub next_check: Option<String>,
+    pub update_progress: String,
+}
+
+// ============== 自动更新结构结束 ==============
+
 /// 运行中的部署进程信息
 pub struct RunningDeploy {
     pub task_id: String,
@@ -673,6 +972,24 @@ pub struct AppState {
     task_history: RwLock<VecDeque<DeployTask>>,
     /// 服务启动时间
     started_at: chrono::DateTime<chrono::Utc>,
+    // ========== 隧道相关字段 ==========
+    /// 隧道模式
+    tunnel_mode: TunnelMode,
+    /// 隧道认证令牌
+    tunnel_auth_token: String,
+    /// 隧道服务端状态 (仅 Server 模式)
+    tunnel_server_state: Arc<TunnelServerState>,
+    /// 隧道客户端状态 (仅 Client 模式)
+    tunnel_client_state: Arc<TunnelClientState>,
+    /// 端口映射配置 (Client 模式)
+    tunnel_port_mappings: Vec<PortMapping>,
+    /// 隧道服务端 URL (Client 模式)
+    tunnel_server_url: String,
+    // ========== 自动更新相关字段 ==========
+    /// 自动更新配置
+    auto_update_config: Option<AutoUpdateConfig>,
+    /// 自动更新状态
+    auto_update_state: Arc<AutoUpdateState>,
 }
 
 impl AppState {
@@ -807,6 +1124,30 @@ impl AppState {
             }
         }
 
+        // 隧道配置
+        let tunnel_mode = TunnelMode::from_env();
+        let tunnel_auth_token = env::var("TUNNEL_AUTH_TOKEN")
+            .unwrap_or_else(|_| "change-tunnel-token".to_string());
+        let tunnel_server_url = env::var("TUNNEL_SERVER_URL")
+            .unwrap_or_else(|_| "ws://localhost:9878/tunnel/ws".to_string());
+        let tunnel_port_mappings = PortMapping::from_env();
+
+        if tunnel_mode != TunnelMode::Disabled {
+            info!(
+                "Tunnel mode: {:?}, mappings: {:?}",
+                tunnel_mode, tunnel_port_mappings
+            );
+        }
+
+        // 自动更新配置
+        let auto_update_config = AutoUpdateConfig::from_env();
+        if let Some(ref config) = auto_update_config {
+            info!(
+                "Auto-update enabled: check interval {}s, endpoint: {}",
+                config.check_interval_secs, config.endpoint
+            );
+        }
+
         Self {
             api_key,
             projects,
@@ -816,6 +1157,16 @@ impl AppState {
             running_deploys: RwLock::new(HashMap::new()),
             task_history: RwLock::new(VecDeque::with_capacity(MAX_TASK_HISTORY)),
             started_at: chrono::Utc::now(),
+            // 隧道
+            tunnel_mode,
+            tunnel_auth_token,
+            tunnel_server_state: Arc::new(TunnelServerState::new()),
+            tunnel_client_state: Arc::new(TunnelClientState::new()),
+            tunnel_port_mappings,
+            tunnel_server_url,
+            // 自动更新
+            auto_update_config,
+            auto_update_state: Arc::new(AutoUpdateState::new()),
         }
     }
 
@@ -887,8 +1238,33 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     let projects: Vec<String> = state.projects.keys().cloned().collect();
 
-    // 检查是否配置了 xjp-deploy-agent 项目（表示支持自动更新）
-    let auto_update_enabled = state.projects.contains_key("xjp-deploy-agent");
+    // 构建自动更新状态
+    let auto_update_status = if let Some(ref _config) = state.auto_update_config {
+        let update_state = &state.auto_update_state;
+        AutoUpdateStatus {
+            enabled: true,
+            current_version: VERSION.to_string(),
+            latest_version: update_state.latest_version.read().await.clone(),
+            update_available: *update_state.update_available.read().await,
+            last_check: update_state.last_check.read().await.map(|t| t.to_rfc3339()),
+            last_check_result: update_state.last_check_result.read().await.clone(),
+            next_check: update_state.next_check.read().await.map(|t| t.to_rfc3339()),
+            update_progress: update_state.update_progress.read().await.clone(),
+        }
+    } else {
+        // 回退到旧的逻辑：检查是否配置了 xjp-deploy-agent 项目
+        let legacy_enabled = state.projects.contains_key("xjp-deploy-agent");
+        AutoUpdateStatus {
+            enabled: legacy_enabled,
+            current_version: VERSION.to_string(),
+            latest_version: None,
+            update_available: false,
+            last_check: None,
+            last_check_result: None,
+            next_check: None,
+            update_progress: "none".to_string(),
+        }
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -898,7 +1274,8 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "projects": projects,
         "active_deploys": active_count,
         "active_projects": active_projects,
-        "auto_update_enabled": auto_update_enabled
+        "auto_update_enabled": auto_update_status.enabled,
+        "auto_update": auto_update_status
     }))
 }
 
@@ -1056,18 +1433,47 @@ async fn trigger_deploy(
                 old_task.exit_code = Some(-2); // -2 表示被取消
             }
 
-            // 通知 deploy-center 旧任务被取消
+            // 通知 deploy-center 旧任务被取消（带重试和超时）
             if let Some(ref callback_url) = state.callback_url {
                 let client = reqwest::Client::new();
                 let url = format!("{}/api/deploy/logs/{}", callback_url, old_deploy.task_id);
-                let _ = client
+                let old_task_id = old_deploy.task_id.clone();
+
+                // 使用与正常完成相同的字段格式，确保 deploy-center 能正确处理
+                let result = client
                     .patch(&url)
+                    .timeout(std::time::Duration::from_secs(10))
                     .json(&serde_json::json!({
                         "status": "failed",
+                        "exit_code": -2,  // -2 表示被新提交取消
                         "error_message": "Cancelled: superseded by newer commit"
                     }))
                     .send()
                     .await;
+
+                match result {
+                    Ok(resp) => {
+                        if !resp.status().is_success() {
+                            warn!(
+                                task_id = %old_task_id,
+                                status = %resp.status(),
+                                "Failed to notify deploy-center about cancellation"
+                            );
+                        } else {
+                            info!(
+                                task_id = %old_task_id,
+                                "Notified deploy-center about task cancellation"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            task_id = %old_task_id,
+                            error = %e,
+                            "Failed to send cancellation notification to deploy-center"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1233,6 +1639,41 @@ async fn run_deploy(
     let http_client = reqwest::Client::new();
     let callback_url = state.callback_url.clone();
     let task_id_for_log = task_id.clone();
+
+    // 启动心跳任务 - 每 15 秒发送一次心跳
+    let heartbeat_task = {
+        let http_client = http_client.clone();
+        let callback_url = callback_url.clone();
+        let task_id = task_id.clone();
+        let cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Some(ref url) = callback_url {
+                            let heartbeat_url = format!("{}/api/deploy/logs/{}/heartbeat", url, task_id);
+                            let _ = http_client
+                                .post(&heartbeat_url)
+                                .timeout(std::time::Duration::from_secs(5))
+                                .send()
+                                .await;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // 部署总超时保护
+    let timeout_cancel = cancel_token.clone();
+    let timeout_task_id = task_id.clone();
+    let timeout_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(DEPLOY_TIMEOUT_SECS)).await;
+        error!(task_id = %timeout_task_id, "Script deployment timed out after {} minutes", DEPLOY_TIMEOUT_SECS / 60);
+        timeout_cancel.cancel();
+    });
 
     let send_log = |stream: &str, content: String| {
         let line = LogLine {
@@ -1446,10 +1887,10 @@ async fn run_deploy(
 
     // 等待进程完成，同时监听取消信号
     let (status, exit_code) = tokio::select! {
-        // 取消信号
+        // 取消信号（可能是被新提交取消，也可能是超时）
         _ = cancel_token.cancelled() => {
-            warn!(task_id = %task_id, project = %project, "Deployment cancelled by newer commit");
-            log_line!("stderr", "=== Deployment CANCELLED: superseded by newer commit ===".to_string());
+            warn!(task_id = %task_id, project = %project, "Deployment cancelled");
+            log_line!("stderr", "=== Deployment CANCELLED ===".to_string());
 
             // 尝试杀死子进程
             if let Err(e) = child.kill().await {
@@ -1460,13 +1901,25 @@ async fn run_deploy(
             stdout_task.abort();
             stderr_task.abort();
 
+            // 停止心跳和超时任务
+            heartbeat_task.abort();
+            timeout_task.abort();
+
             // 从 running_deploys 中移除（如果还在）
             {
                 let mut running = state.running_deploys.write().await;
                 running.remove(&project);
             }
 
-            // 取消时不需要再通知 deploy-center，因为 trigger_deploy 已经处理了
+            // 更新任务状态为失败
+            update_task_status(&state, &task_id, DeployStatus::Failed, Some(-2)).await;
+
+            // 通知 deploy-center
+            if let Some(ref callback_url) = state.callback_url {
+                let _ = notify_deploy_center(callback_url, &task_id, &project, &DeployStatus::Failed, -2).await;
+            }
+
+            info!(task_id = %task_id, project = %project, "Deployment cancelled, exit_code=-2");
             return;
         }
 
@@ -1494,6 +1947,10 @@ async fn run_deploy(
             }
         }
     };
+
+    // 停止心跳和超时任务
+    heartbeat_task.abort();
+    timeout_task.abort();
 
     // 从 running_deploys 中移除
     {
@@ -2012,6 +2469,11 @@ async fn cleanup_zombie_docker_processes() -> (usize, usize) {
     (zombies_killed, hung_builds_killed)
 }
 
+/// 部署超时时间（30 分钟）
+const DEPLOY_TIMEOUT_SECS: u64 = 30 * 60;
+/// 心跳间隔（15 秒）
+const HEARTBEAT_INTERVAL_SECS: u64 = 15;
+
 /// Docker Build 部署 - 拉取代码、构建镜像、推送到 registry
 #[allow(clippy::too_many_arguments)]
 async fn run_docker_build_deploy(
@@ -2032,6 +2494,55 @@ async fn run_docker_build_deploy(
     let http_client = reqwest::Client::new();
     let callback_url = state.callback_url.clone();
     let task_id_for_log = task_id.clone();
+
+    // 启动心跳任务 - 每 15 秒发送一次心跳，确保 deploy center 知道我们还活着
+    let heartbeat_task = {
+        let http_client = http_client.clone();
+        let callback_url = callback_url.clone();
+        let task_id = task_id.clone();
+        let cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        info!(task_id = %task_id, "Heartbeat task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if let Some(ref url) = callback_url {
+                            let heartbeat_url = format!("{}/api/deploy/logs/{}/heartbeat", url, task_id);
+                            match http_client
+                                .post(&heartbeat_url)
+                                .timeout(std::time::Duration::from_secs(5))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    // 心跳成功，不记录以减少日志噪音
+                                }
+                                Ok(resp) => {
+                                    warn!(task_id = %task_id, status = %resp.status(), "Heartbeat returned non-success");
+                                }
+                                Err(e) => {
+                                    warn!(task_id = %task_id, error = %e, "Heartbeat failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // 部署总超时保护
+    let timeout_cancel = cancel_token.clone();
+    let timeout_task_id = task_id.clone();
+    let timeout_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(DEPLOY_TIMEOUT_SECS)).await;
+        error!(task_id = %timeout_task_id, "Deployment timed out after {} minutes", DEPLOY_TIMEOUT_SECS / 60);
+        timeout_cancel.cancel();
+    });
 
     // 实时发送日志到 deploy-center
     let send_log_to_center = {
@@ -2294,10 +2805,63 @@ async fn run_docker_build_deploy(
                     }
                 });
 
-                // 等待输出读取完成
-                let _ = tokio::join!(stderr_task, stdout_task);
+                // 等待构建完成，同时监听取消信号
+                let build_result = tokio::select! {
+                    // 取消信号
+                    _ = cancel_token.cancelled() => {
+                        warn!(task_id = %task_id, project = %project, "Docker build cancelled by newer commit");
+                        log_line!("stderr", "=== Docker build CANCELLED: superseded by newer commit ===".to_string());
 
-                match child.wait().await {
+                        // 杀死构建进程
+                        if let Err(e) = child.kill().await {
+                            warn!(task_id = %task_id, error = %e, "Failed to kill docker build process");
+                        }
+
+                        // 中止输出任务
+                        stderr_task.abort();
+                        stdout_task.abort();
+
+                        // 标记所有未完成的阶段为跳过
+                        for stage in stages.iter_mut() {
+                            if matches!(stage.status, StageStatus::Pending | StageStatus::Running) {
+                                stage.status = StageStatus::Skipped;
+                            }
+                        }
+
+                        // 更新状态并通知 deploy-center
+                        status = DeployStatus::Failed;
+                        exit_code = -2;
+
+                        log_line!("stdout", "=== Docker Build Deploy cancelled ===".to_string());
+
+                        // 停止心跳和超时任务
+                        heartbeat_task.abort();
+                        timeout_task.abort();
+
+                        update_task_status_with_stages(&state, &task_id, status.clone(), Some(exit_code), stages.clone()).await;
+
+                        if let Some(ref callback_url) = state.callback_url {
+                            let _ = notify_deploy_center_with_stages(callback_url, &task_id, &project, &status, exit_code, &stages).await;
+                        }
+
+                        info!(
+                            task_id = %task_id,
+                            project = %project,
+                            exit_code = exit_code,
+                            "Docker Build deployment cancelled"
+                        );
+                        return;  // 提前退出函数
+                    }
+
+                    // 正常等待构建完成
+                    result = child.wait() => {
+                        // 等待输出读取完成
+                        let _ = tokio::join!(stderr_task, stdout_task);
+                        result
+                    }
+                };
+
+                match build_result {
                     Ok(exit_status) => {
                         if exit_status.success() {
                             stages[1].finish(true, None);
@@ -2329,6 +2893,13 @@ async fn run_docker_build_deploy(
     // ============================================
     // Stage 3: Docker Push
     // ============================================
+    // 检查取消
+    if exit_code == 0 && cancel_token.is_cancelled() {
+        log_line!("stderr", "=== Deployment cancelled before push ===".to_string());
+        status = DeployStatus::Failed;
+        exit_code = -2;
+    }
+
     if exit_code == 0 {
         stages[2].start();
         send_stage_update(stages.clone());
@@ -2372,6 +2943,13 @@ async fn run_docker_build_deploy(
     // ============================================
     // Stage 4: Push Latest Tag (optional)
     // ============================================
+    // 检查取消
+    if exit_code == 0 && cancel_token.is_cancelled() {
+        log_line!("stderr", "=== Deployment cancelled before push latest ===".to_string());
+        status = DeployStatus::Failed;
+        exit_code = -2;
+    }
+
     if exit_code == 0 && push_latest && stages.len() > 3 {
         stages[3].start();
         send_stage_update(stages.clone());
@@ -2441,6 +3019,10 @@ async fn run_docker_build_deploy(
         log_line!("stdout", format!("{} {} ({})", status_icon, stage.display_name, duration));
     }
 
+    // 停止心跳和超时任务
+    heartbeat_task.abort();
+    timeout_task.abort();
+
     // 更新任务状态（包含 stages）
     update_task_status_with_stages(&state, &task_id, status.clone(), Some(exit_code), stages.clone()).await;
 
@@ -2489,6 +3071,7 @@ async fn update_task_status_with_stages(
 }
 
 /// 回调通知部署中心（包含阶段信息）
+/// 带超时和重试机制，确保状态更新不会丢失
 async fn notify_deploy_center_with_stages(
     callback_url: &str,
     task_id: &str,
@@ -2505,24 +3088,72 @@ async fn notify_deploy_center_with_stages(
     };
 
     let url = format!("{}/api/deploy/logs/{}", callback_url, task_id);
-    client
-        .patch(&url)
-        .json(&serde_json::json!({
-            "status": status_str,
-            "exit_code": exit_code,
-            "stages": stages
-        }))
-        .send()
-        .await?;
+    let body = serde_json::json!({
+        "status": status_str,
+        "exit_code": exit_code,
+        "stages": stages
+    });
 
-    info!(
+    // 最多重试3次，每次超时10秒
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match client
+            .patch(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!(
+                        task_id = %task_id,
+                        project = %project,
+                        status = %status_str,
+                        attempt = attempt,
+                        "Notified deploy center with stages"
+                    );
+                    return Ok(());
+                } else {
+                    warn!(
+                        task_id = %task_id,
+                        project = %project,
+                        status = %resp.status(),
+                        attempt = attempt,
+                        "Deploy center returned non-success status"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    project = %project,
+                    error = %e,
+                    attempt = attempt,
+                    "Failed to notify deploy center, will retry"
+                );
+                last_error = Some(e);
+            }
+        }
+
+        // 重试前等待
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
+    // 所有重试都失败了
+    error!(
         task_id = %task_id,
         project = %project,
-        status = %status_str,
-        "Notified deploy center with stages"
+        "Failed to notify deploy center after 3 attempts"
     );
 
-    Ok(())
+    if let Some(e) = last_error {
+        Err(e)
+    } else {
+        Ok(()) // 响应不是成功但没有网络错误
+    }
 }
 
 /// 更新任务状态
@@ -2556,6 +3187,7 @@ async fn update_task_status(
 }
 
 /// 通知部署中心
+/// 带超时和重试机制，确保状态更新不会丢失
 async fn notify_deploy_center(
     callback_url: &str,
     task_id: &str,
@@ -2571,18 +3203,71 @@ async fn notify_deploy_center(
     };
 
     let url = format!("{}/api/deploy/logs/{}", callback_url, task_id);
+    let body = serde_json::json!({
+        "status": status_str,
+        "exit_code": exit_code,
+    });
 
-    client
-        .patch(&url)
-        .json(&serde_json::json!({
-            "status": status_str,
-            "exit_code": exit_code,
-        }))
-        .send()
-        .await?;
+    // 最多重试3次，每次超时10秒
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match client
+            .patch(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!(
+                        task_id = %task_id,
+                        project = %project,
+                        status = %status_str,
+                        attempt = attempt,
+                        "Notified deploy center"
+                    );
+                    return Ok(());
+                } else {
+                    warn!(
+                        task_id = %task_id,
+                        project = %project,
+                        status = %resp.status(),
+                        attempt = attempt,
+                        "Deploy center returned non-success status"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    project = %project,
+                    error = %e,
+                    attempt = attempt,
+                    "Failed to notify deploy center, will retry"
+                );
+                last_error = Some(e);
+            }
+        }
 
-    info!(task_id = %task_id, project = %project, status = %status_str, "Notified deploy center");
-    Ok(())
+        // 重试前等待
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
+    // 所有重试都失败了
+    error!(
+        task_id = %task_id,
+        project = %project,
+        "Failed to notify deploy center after 3 attempts"
+    );
+
+    if let Some(e) = last_error {
+        Err(e)
+    } else {
+        Ok(()) // 响应不是成功但没有网络错误
+    }
 }
 
 /// 从部署中心获取项目配置
@@ -4419,6 +5104,875 @@ async fn db_export_data(
 
 // ============== 数据库管理端点结束 ==============
 
+// ============== 隧道端点 ==============
+
+/// 获取隧道状态
+async fn get_tunnel_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !state.verify_api_key(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let response = match &state.tunnel_mode {
+        TunnelMode::Server => {
+            let server_state = &state.tunnel_server_state;
+            let client_connected = *server_state.client_connected.read().await;
+            let client_addr = server_state.client_addr.read().await.clone();
+            let client_connected_at = *server_state.client_connected_at.read().await;
+            let client_mappings = server_state.client_mappings.read().await.clone();
+            let port_listeners = server_state.port_listeners.read().await;
+
+            let port_mappings: Vec<PortMappingStatus> = client_mappings
+                .iter()
+                .map(|m| PortMappingStatus {
+                    mapping: m.clone(),
+                    status: if port_listeners.contains_key(&m.remote_port) {
+                        "listening".to_string()
+                    } else {
+                        "pending".to_string()
+                    },
+                    active_connections: 0, // TODO: 统计活跃连接数
+                })
+                .collect();
+
+            TunnelStatusResponse::Server(TunnelServerStatus {
+                listening: true,
+                listen_port: env::var("PORT").unwrap_or_else(|_| "9876".to_string()).parse().unwrap_or(9876),
+                client_connected,
+                client_addr,
+                client_connected_at,
+                port_mappings,
+            })
+        }
+        TunnelMode::Client => {
+            let client_state = &state.tunnel_client_state;
+            let connected = *client_state.connected.read().await;
+            let connected_at = *client_state.connected_at.read().await;
+            let last_error = client_state.last_error.read().await.clone();
+            let reconnect_count = *client_state.reconnect_count.read().await;
+
+            let mappings: Vec<PortMappingStatus> = state
+                .tunnel_port_mappings
+                .iter()
+                .map(|m| PortMappingStatus {
+                    mapping: m.clone(),
+                    status: if connected { "active".to_string() } else { "disconnected".to_string() },
+                    active_connections: 0,
+                })
+                .collect();
+
+            TunnelStatusResponse::Client(TunnelClientStatus {
+                connected,
+                server_url: state.tunnel_server_url.clone(),
+                connected_at,
+                last_error,
+                reconnect_count,
+                mappings,
+            })
+        }
+        TunnelMode::Disabled => TunnelStatusResponse::Disabled,
+    };
+
+    Json(response).into_response()
+}
+
+/// WebSocket 隧道端点 (Server 模式)
+async fn tunnel_websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // 验证 token
+    let token = headers
+        .get("x-tunnel-token")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            // 也检查 query parameter
+            headers
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok())
+        });
+
+    if token != Some(&state.tunnel_auth_token) {
+        return (StatusCode::UNAUTHORIZED, "Invalid tunnel token").into_response();
+    }
+
+    if state.tunnel_mode != TunnelMode::Server {
+        return (StatusCode::BAD_REQUEST, "Tunnel server mode not enabled").into_response();
+    }
+
+    // 获取客户端地址
+    let client_addr = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    ws.on_upgrade(move |socket| handle_tunnel_server_connection(socket, state, client_addr))
+}
+
+/// 处理 Server 端的隧道连接
+async fn handle_tunnel_server_connection(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    client_addr: String,
+) {
+    info!(client_addr = %client_addr, "Tunnel client connected");
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let server_state = &state.tunnel_server_state;
+
+    // 创建发送通道
+    let (msg_tx, mut msg_rx) = mpsc::channel::<TunnelMessage>(256);
+
+    // 更新连接状态
+    {
+        *server_state.client_connected.write().await = true;
+        *server_state.client_addr.write().await = Some(client_addr.clone());
+        *server_state.client_connected_at.write().await = Some(chrono::Utc::now());
+        *server_state.ws_tx.write().await = Some(msg_tx.clone());
+    }
+
+    // 启动发送任务
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            let data = match bincode::serialize(&msg) {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("Failed to serialize tunnel message: {}", e);
+                    continue;
+                }
+            };
+            if ws_sender.send(Message::Binary(data)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 接收和处理消息
+    while let Some(msg) = ws_receiver.next().await {
+        match msg {
+            Ok(Message::Binary(data)) => {
+                match bincode::deserialize::<TunnelMessage>(&data) {
+                    Ok(tunnel_msg) => {
+                        handle_server_tunnel_message(tunnel_msg, &state, &msg_tx).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize tunnel message: {}", e);
+                    }
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                // 自动由 axum 处理 pong
+                let _ = data;
+            }
+            Ok(Message::Close(_)) => {
+                info!("Tunnel client disconnected");
+                break;
+            }
+            Err(e) => {
+                error!("WebSocket error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // 清理连接状态
+    {
+        *server_state.client_connected.write().await = false;
+        *server_state.client_addr.write().await = None;
+        *server_state.ws_tx.write().await = None;
+
+        // 停止所有端口监听器
+        let mut listeners = server_state.port_listeners.write().await;
+        for (port, cancel) in listeners.drain() {
+            info!(port = port, "Stopping port listener");
+            cancel.cancel();
+        }
+
+        // 清理代理连接
+        server_state.proxy_connections.write().await.clear();
+        server_state.client_mappings.write().await.clear();
+    }
+
+    send_task.abort();
+    info!("Tunnel connection cleanup complete");
+}
+
+/// 处理 Server 端收到的隧道消息
+async fn handle_server_tunnel_message(
+    msg: TunnelMessage,
+    state: &Arc<AppState>,
+    ws_tx: &mpsc::Sender<TunnelMessage>,
+) {
+    let server_state = &state.tunnel_server_state;
+
+    match msg {
+        TunnelMessage::Config { mappings } => {
+            info!(mappings = ?mappings, "Received port mappings from client");
+
+            // 保存映射配置
+            *server_state.client_mappings.write().await = mappings.clone();
+
+            // 为每个映射启动端口监听器
+            for mapping in mappings {
+                let port = mapping.remote_port;
+                let state_clone = state.clone();
+                let ws_tx_clone = ws_tx.clone();
+                let cancel = CancellationToken::new();
+                let cancel_clone = cancel.clone();
+
+                server_state.port_listeners.write().await.insert(port, cancel);
+
+                tokio::spawn(async move {
+                    start_port_listener(port, state_clone, ws_tx_clone, cancel_clone).await;
+                });
+            }
+        }
+        TunnelMessage::Connected { conn_id } => {
+            info!(conn_id = %conn_id, "Client confirmed connection");
+        }
+        TunnelMessage::ConnectFailed { conn_id, error } => {
+            warn!(conn_id = %conn_id, error = %error, "Client failed to connect to local service");
+            // 清理代理连接
+            server_state.proxy_connections.write().await.remove(&conn_id);
+        }
+        TunnelMessage::Data { conn_id, data } => {
+            // 将数据转发到对应的代理连接
+            let connections = server_state.proxy_connections.read().await;
+            if let Some(tx) = connections.get(&conn_id) {
+                if tx.send(data).await.is_err() {
+                    drop(connections);
+                    server_state.proxy_connections.write().await.remove(&conn_id);
+                }
+            }
+        }
+        TunnelMessage::Close { conn_id } => {
+            info!(conn_id = %conn_id, "Client closed connection");
+            server_state.proxy_connections.write().await.remove(&conn_id);
+        }
+        TunnelMessage::Pong => {
+            // 心跳响应
+        }
+        _ => {}
+    }
+}
+
+/// 启动端口监听器 (Server 模式)
+async fn start_port_listener(
+    port: u16,
+    state: Arc<AppState>,
+    ws_tx: mpsc::Sender<TunnelMessage>,
+    cancel: CancellationToken,
+) {
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(port = port, error = %e, "Failed to bind port listener");
+            return;
+        }
+    };
+
+    info!(port = port, "Port listener started");
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!(port = port, "Port listener cancelled");
+                break;
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, remote_addr)) => {
+                        let conn_id = Uuid::new_v4().to_string();
+                        info!(
+                            conn_id = %conn_id,
+                            port = port,
+                            remote_addr = %remote_addr,
+                            "New connection on tunnel port"
+                        );
+
+                        // 创建代理连接通道
+                        let (proxy_tx, proxy_rx) = mpsc::channel::<Vec<u8>>(256);
+
+                        // 保存代理连接
+                        state.tunnel_server_state.proxy_connections.write().await
+                            .insert(conn_id.clone(), proxy_tx);
+
+                        // 发送连接请求到客户端
+                        let _ = ws_tx.send(TunnelMessage::Connect {
+                            conn_id: conn_id.clone(),
+                            remote_port: port,
+                        }).await;
+
+                        // 启动数据转发任务
+                        let ws_tx_clone = ws_tx.clone();
+                        let state_clone = state.clone();
+                        tokio::spawn(async move {
+                            handle_proxy_connection(
+                                conn_id,
+                                stream,
+                                proxy_rx,
+                                ws_tx_clone,
+                                state_clone,
+                            ).await;
+                        });
+                    }
+                    Err(e) => {
+                        error!(port = port, error = %e, "Failed to accept connection");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 处理代理连接的数据转发 (Server 模式)
+async fn handle_proxy_connection(
+    conn_id: String,
+    stream: TcpStream,
+    mut proxy_rx: mpsc::Receiver<Vec<u8>>,
+    ws_tx: mpsc::Sender<TunnelMessage>,
+    state: Arc<AppState>,
+) {
+    let (mut reader, mut writer) = stream.into_split();
+
+    // 从 TCP 读取并发送到隧道
+    let conn_id_read = conn_id.clone();
+    let ws_tx_read = ws_tx.clone();
+    let read_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    if ws_tx_read.send(TunnelMessage::Data {
+                        conn_id: conn_id_read.clone(),
+                        data,
+                    }).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(conn_id = %conn_id_read, error = %e, "Read error");
+                    break;
+                }
+            }
+        }
+        // 发送关闭消息
+        let _ = ws_tx_read.send(TunnelMessage::Close {
+            conn_id: conn_id_read,
+        }).await;
+    });
+
+    // 从隧道接收并写入 TCP
+    let _conn_id_write = conn_id.clone();
+    let write_task = tokio::spawn(async move {
+        while let Some(data) = proxy_rx.recv().await {
+            if writer.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 等待任一任务完成
+    tokio::select! {
+        _ = read_task => {}
+        _ = write_task => {}
+    }
+
+    // 清理
+    state.tunnel_server_state.proxy_connections.write().await.remove(&conn_id);
+}
+
+/// 启动隧道客户端 (Client 模式)
+async fn start_tunnel_client(state: Arc<AppState>) {
+    let server_url = state.tunnel_server_url.clone();
+    let reconnect_interval = env::var("TUNNEL_RECONNECT_INTERVAL")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse::<u64>()
+        .unwrap_or(5);
+
+    loop {
+        info!(server_url = %server_url, "Connecting to tunnel server");
+
+        match connect_tunnel_client(&state).await {
+            Ok(_) => {
+                warn!("Tunnel connection closed, will reconnect");
+            }
+            Err(e) => {
+                error!(error = %e, "Tunnel connection failed");
+                let mut last_error = state.tunnel_client_state.last_error.write().await;
+                *last_error = Some(e.to_string());
+            }
+        }
+
+        // 更新状态
+        {
+            *state.tunnel_client_state.connected.write().await = false;
+            *state.tunnel_client_state.connected_at.write().await = None;
+            let mut count = state.tunnel_client_state.reconnect_count.write().await;
+            *count += 1;
+        }
+
+        tokio::time::sleep(Duration::from_secs(reconnect_interval)).await;
+    }
+}
+
+/// 连接到隧道服务端
+async fn connect_tunnel_client(state: &Arc<AppState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = url::Url::parse(&state.tunnel_server_url)?;
+
+    // 构建带认证的请求
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(state.tunnel_server_url.as_str())
+        .header("x-tunnel-token", &state.tunnel_auth_token)
+        .header("Host", url.host_str().unwrap_or("localhost"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .body(())?;
+
+    let (ws_stream, _) = connect_async(request).await?;
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    // 更新连接状态
+    {
+        *state.tunnel_client_state.connected.write().await = true;
+        *state.tunnel_client_state.connected_at.write().await = Some(chrono::Utc::now());
+        *state.tunnel_client_state.last_error.write().await = None;
+    }
+
+    info!("Connected to tunnel server");
+
+    // 发送端口映射配置
+    let config_msg = TunnelMessage::Config {
+        mappings: state.tunnel_port_mappings.clone(),
+    };
+    let config_data = bincode::serialize(&config_msg)?;
+    ws_sender.send(TungsteniteMessage::Binary(config_data)).await?;
+
+    info!(mappings = ?state.tunnel_port_mappings, "Sent port mappings to server");
+
+    // 创建发送通道
+    let (msg_tx, mut msg_rx) = mpsc::channel::<TunnelMessage>(256);
+
+    // 启动发送任务
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            let data = match bincode::serialize(&msg) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if ws_sender.send(TungsteniteMessage::Binary(data)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 处理消息
+    while let Some(msg) = ws_receiver.next().await {
+        match msg? {
+            TungsteniteMessage::Binary(data) => {
+                let tunnel_msg: TunnelMessage = bincode::deserialize(&data)?;
+                handle_client_tunnel_message(tunnel_msg, state, &msg_tx).await;
+            }
+            TungsteniteMessage::Ping(data) => {
+                // tungstenite 自动处理 pong
+                let _ = data;
+            }
+            TungsteniteMessage::Close(_) => {
+                info!("Server closed connection");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    send_task.abort();
+    Ok(())
+}
+
+/// 处理 Client 端收到的隧道消息
+async fn handle_client_tunnel_message(
+    msg: TunnelMessage,
+    state: &Arc<AppState>,
+    ws_tx: &mpsc::Sender<TunnelMessage>,
+) {
+    match msg {
+        TunnelMessage::Connect { conn_id, remote_port } => {
+            info!(conn_id = %conn_id, remote_port = remote_port, "Server requests connection");
+
+            // 找到对应的本地映射
+            let mapping = state.tunnel_port_mappings.iter()
+                .find(|m| m.remote_port == remote_port);
+
+            let mapping = match mapping {
+                Some(m) => m.clone(),
+                None => {
+                    let _ = ws_tx.send(TunnelMessage::ConnectFailed {
+                        conn_id,
+                        error: format!("No mapping for port {}", remote_port),
+                    }).await;
+                    return;
+                }
+            };
+
+            // 连接到本地服务
+            let local_addr = format!("{}:{}", mapping.local_host, mapping.local_port);
+            let local_stream = match TcpStream::connect(&local_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(
+                        conn_id = %conn_id,
+                        local_addr = %local_addr,
+                        error = %e,
+                        "Failed to connect to local service"
+                    );
+                    let _ = ws_tx.send(TunnelMessage::ConnectFailed {
+                        conn_id,
+                        error: e.to_string(),
+                    }).await;
+                    return;
+                }
+            };
+
+            info!(conn_id = %conn_id, local_addr = %local_addr, "Connected to local service");
+
+            // 发送确认
+            let _ = ws_tx.send(TunnelMessage::Connected {
+                conn_id: conn_id.clone(),
+            }).await;
+
+            // 创建本地连接通道
+            let (local_tx, local_rx) = mpsc::channel::<Vec<u8>>(256);
+            state.tunnel_client_state.local_connections.write().await
+                .insert(conn_id.clone(), local_tx);
+
+            // 启动数据转发
+            let ws_tx_clone = ws_tx.clone();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                handle_local_proxy_connection(
+                    conn_id,
+                    local_stream,
+                    local_rx,
+                    ws_tx_clone,
+                    state_clone,
+                ).await;
+            });
+        }
+        TunnelMessage::Data { conn_id, data } => {
+            // 转发到本地连接
+            let connections = state.tunnel_client_state.local_connections.read().await;
+            if let Some(tx) = connections.get(&conn_id) {
+                if tx.send(data).await.is_err() {
+                    drop(connections);
+                    state.tunnel_client_state.local_connections.write().await.remove(&conn_id);
+                }
+            }
+        }
+        TunnelMessage::Close { conn_id } => {
+            info!(conn_id = %conn_id, "Server closed connection");
+            state.tunnel_client_state.local_connections.write().await.remove(&conn_id);
+        }
+        TunnelMessage::Ping => {
+            let _ = ws_tx.send(TunnelMessage::Pong).await;
+        }
+        _ => {}
+    }
+}
+
+/// 处理本地代理连接的数据转发 (Client 模式)
+async fn handle_local_proxy_connection(
+    conn_id: String,
+    stream: TcpStream,
+    mut local_rx: mpsc::Receiver<Vec<u8>>,
+    ws_tx: mpsc::Sender<TunnelMessage>,
+    state: Arc<AppState>,
+) {
+    let (mut reader, mut writer) = stream.into_split();
+
+    // 从本地服务读取并发送到隧道
+    let conn_id_read = conn_id.clone();
+    let ws_tx_read = ws_tx.clone();
+    let read_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    if ws_tx_read.send(TunnelMessage::Data {
+                        conn_id: conn_id_read.clone(),
+                        data,
+                    }).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = ws_tx_read.send(TunnelMessage::Close {
+            conn_id: conn_id_read,
+        }).await;
+    });
+
+    // 从隧道接收并写入本地服务
+    let write_task = tokio::spawn(async move {
+        while let Some(data) = local_rx.recv().await {
+            if writer.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = read_task => {}
+        _ = write_task => {}
+    }
+
+    state.tunnel_client_state.local_connections.write().await.remove(&conn_id);
+}
+
+// ============== 隧道端点结束 ==============
+
+// ============== 自动更新功能 ==============
+
+/// 启动自动更新后台任务
+async fn start_auto_update_task(state: Arc<AppState>) {
+    let config = match &state.auto_update_config {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    info!("Starting auto-update background task");
+
+    // 启动时立即检查一次
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    check_and_apply_update(&state, &config).await;
+
+    // 定期检查
+    let interval = Duration::from_secs(config.check_interval_secs);
+    loop {
+        // 更新下一次检查时间
+        let next = chrono::Utc::now() + chrono::Duration::seconds(config.check_interval_secs as i64);
+        *state.auto_update_state.next_check.write().await = Some(next);
+
+        tokio::time::sleep(interval).await;
+        check_and_apply_update(&state, &config).await;
+    }
+}
+
+/// 检查并应用更新
+async fn check_and_apply_update(state: &Arc<AppState>, config: &AutoUpdateConfig) {
+    info!("Checking for updates...");
+    *state.auto_update_state.last_check.write().await = Some(chrono::Utc::now());
+
+    // 获取最新版本信息
+    let metadata_url = format!("{}/{}", config.endpoint, config.metadata_path);
+    let metadata = match fetch_update_metadata(&metadata_url).await {
+        Ok(m) => m,
+        Err(e) => {
+            let msg = format!("Failed to fetch metadata: {}", e);
+            warn!("{}", msg);
+            *state.auto_update_state.last_check_result.write().await = Some(msg);
+            return;
+        }
+    };
+
+    *state.auto_update_state.latest_version.write().await = Some(metadata.version.clone());
+
+    // 比较版本
+    if metadata.version == VERSION {
+        *state.auto_update_state.update_available.write().await = false;
+        *state.auto_update_state.last_check_result.write().await = Some("Already at latest version".to_string());
+        info!("Already at latest version: {}", VERSION);
+        return;
+    }
+
+    // 检查是否为更新版本（简单字符串比较，假设语义化版本）
+    if !is_newer_version(&metadata.version, VERSION) {
+        *state.auto_update_state.update_available.write().await = false;
+        *state.auto_update_state.last_check_result.write().await = Some(format!("Current {} >= remote {}", VERSION, metadata.version));
+        info!("Current version {} is not older than {}", VERSION, metadata.version);
+        return;
+    }
+
+    info!("New version available: {} (current: {})", metadata.version, VERSION);
+    *state.auto_update_state.update_available.write().await = true;
+    *state.auto_update_state.last_check_result.write().await = Some(format!("Update available: {}", metadata.version));
+
+    // 下载并应用更新
+    if let Err(e) = download_and_apply_update(state, config, &metadata).await {
+        error!("Failed to apply update: {}", e);
+        *state.auto_update_state.update_progress.write().await = "failed".to_string();
+        *state.auto_update_state.last_check_result.write().await = Some(format!("Update failed: {}", e));
+    }
+}
+
+/// 获取更新元数据
+async fn fetch_update_metadata(url: &str) -> Result<UpdateMetadata, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client.get(url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    resp.json::<UpdateMetadata>()
+        .await
+        .map_err(|e| format!("JSON parse failed: {}", e))
+}
+
+/// 比较版本号（简单实现）
+fn is_newer_version(new: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    };
+
+    let new_parts = parse(new);
+    let current_parts = parse(current);
+
+    for i in 0..std::cmp::max(new_parts.len(), current_parts.len()) {
+        let n = new_parts.get(i).copied().unwrap_or(0);
+        let c = current_parts.get(i).copied().unwrap_or(0);
+        if n > c {
+            return true;
+        }
+        if n < c {
+            return false;
+        }
+    }
+    false
+}
+
+/// 下载并应用更新
+async fn download_and_apply_update(
+    state: &Arc<AppState>,
+    config: &AutoUpdateConfig,
+    metadata: &UpdateMetadata,
+) -> Result<(), String> {
+    *state.auto_update_state.update_progress.write().await = "downloading".to_string();
+
+    // 构建二进制 URL
+    let binary_name = config.binary_path_template.replace("{version}", &metadata.version);
+    let binary_url = format!("{}/{}", config.endpoint, binary_name);
+
+    info!("Downloading update from: {}", binary_url);
+
+    // 下载二进制
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client.get(&binary_url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed: HTTP {}", resp.status()));
+    }
+
+    let bytes = resp.bytes()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    info!("Downloaded {} bytes", bytes.len());
+
+    // 验证 SHA256
+    *state.auto_update_state.update_progress.write().await = "verifying".to_string();
+    if let Some(expected_sha256) = &metadata.sha256 {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let result = hasher.finalize();
+        let actual_sha256 = hex::encode(result);
+
+        if actual_sha256 != *expected_sha256 {
+            return Err(format!("SHA256 mismatch: expected {}, got {}", expected_sha256, actual_sha256));
+        }
+        info!("SHA256 verified");
+    }
+
+    // 应用更新
+    *state.auto_update_state.update_progress.write().await = "applying".to_string();
+
+    // 获取当前二进制路径
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to get current exe path: {}", e))?;
+
+    let backup_path = current_exe.with_extension("bak");
+    let new_path = current_exe.with_extension("new");
+
+    // 写入新二进制
+    std::fs::write(&new_path, &bytes)
+        .map_err(|e| format!("Failed to write new binary: {}", e))?;
+
+    // 设置可执行权限
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&new_path)
+            .map_err(|e| format!("Failed to get metadata: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&new_path, perms)
+            .map_err(|e| format!("Failed to set permissions: {}", e))?;
+    }
+
+    // 备份当前二进制
+    if current_exe.exists() {
+        std::fs::copy(&current_exe, &backup_path)
+            .map_err(|e| format!("Failed to backup current binary: {}", e))?;
+    }
+
+    // 替换二进制
+    std::fs::rename(&new_path, &current_exe)
+        .map_err(|e| format!("Failed to replace binary: {}", e))?;
+
+    info!("Binary replaced successfully, scheduling restart...");
+    *state.auto_update_state.update_progress.write().await = "restarting".to_string();
+
+    // 调度重启（使用 systemd-run 延迟重启）
+    let _ = Command::new("sudo")
+        .args([
+            "/usr/bin/systemd-run",
+            "--no-block",
+            "--on-active=2s",
+            "/bin/systemctl",
+            "restart",
+            "xjp-deploy-agent",
+        ])
+        .output()
+        .await;
+
+    info!("Service restart scheduled for update");
+    *state.auto_update_state.update_progress.write().await = "none".to_string();
+    *state.auto_update_state.update_available.write().await = false;
+
+    Ok(())
+}
+
+// ============== 自动更新功能结束 ==============
+
 #[tokio::main]
 async fn main() {
     // 初始化日志
@@ -4461,9 +6015,32 @@ async fn main() {
         .route("/db/query", post(db_execute_query))
         .route("/db/execute", post(db_execute_command))
         .route("/db/export", post(db_export_data))
+        // 隧道端点
+        .route("/tunnel/status", get(get_tunnel_status))
+        .route("/tunnel/ws", get(tunnel_websocket_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
+
+    // 如果是 Client 模式，启动隧道客户端
+    if state.tunnel_mode == TunnelMode::Client {
+        let client_state = state.clone();
+        tokio::spawn(async move {
+            start_tunnel_client(client_state).await;
+        });
+        info!("Tunnel client started");
+    } else if state.tunnel_mode == TunnelMode::Server {
+        info!("Tunnel server mode enabled, waiting for client connections on /tunnel/ws");
+    }
+
+    // 启动自动更新任务
+    if state.auto_update_config.is_some() {
+        let update_state = state.clone();
+        tokio::spawn(async move {
+            start_auto_update_task(update_state).await;
+        });
+        info!("Auto-update task started");
+    }
 
     let port = env::var("PORT").unwrap_or_else(|_| "9876".to_string());
     let addr = format!("0.0.0.0:{}", port);
