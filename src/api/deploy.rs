@@ -20,6 +20,7 @@ use tracing::warn;
 use crate::domain::deploy::DeployTask;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::RequireApiKey;
+use crate::services;
 use crate::state::AppState;
 
 /// 触发部署请求
@@ -88,20 +89,23 @@ async fn trigger_deploy(
     Json(request): Json<TriggerRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // 检查项目是否存在
-    // 优先从部署中心获取配置（由 services 层处理）
-    let project_config = state.get_project(&project);
-
-    // 如果本地没有配置，尝试从部署中心获取
-    let has_config = if project_config.is_some() {
-        true
+    // 优先从本地配置，然后尝试从部署中心获取
+    let project_config = if let Some(config) = state.get_project(&project) {
+        // 本地配置存在，克隆使用
+        config.clone()
     } else {
         // 尝试从部署中心获取配置
-        state.deploy_center.fetch_config(&project).await.is_some()
-    };
+        let remote_config = state
+            .deploy_center
+            .fetch_config(&project)
+            .await
+            .ok_or_else(|| ApiError::not_found(format!("Project '{}'", project)))?;
 
-    if !has_config {
-        return Err(ApiError::not_found(format!("Project '{}'", project)));
-    }
+        // 转换为本地 ProjectConfig
+        remote_config
+            .to_project_config()
+            .ok_or_else(|| ApiError::bad_request("Invalid remote config: missing required fields"))?
+    };
 
     // 检查是否已有部署在运行
     if state.has_running_deploy(&project).await {
@@ -127,16 +131,31 @@ async fn trigger_deploy(
     // 注册运行中的部署
     let _cancel_token = state.register_running_deploy(&project, &task_id).await;
 
-    // TODO: 在 services 层实现实际的部署逻辑
-    // services::deploy::execute(state.clone(), task_id.clone(), project.clone(), request).await;
-
-    // 返回响应
-    Ok(Json(TriggerResponse {
+    // 构建响应数据
+    let response = TriggerResponse {
         task_id: task_id.clone(),
         project: project.clone(),
         status: "running".to_string(),
         stream_url: format!("/logs/{}/stream", task_id),
-    }))
+    };
+
+    // 在后台执行部署（非阻塞）
+    let state_clone = state.clone();
+    let task_id_clone = task_id.clone();
+    let project_clone = project.clone();
+    tokio::spawn(async move {
+        services::deploy::execute(
+            state_clone,
+            task_id_clone,
+            project_clone,
+            project_config,
+            request,
+        )
+        .await;
+    });
+
+    // 返回响应
+    Ok(Json(response))
 }
 
 /// 获取任务状态
