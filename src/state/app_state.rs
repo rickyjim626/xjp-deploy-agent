@@ -11,9 +11,12 @@ use crate::config::{
     env::EnvConfig,
     project::{load_projects_from_env, ProjectConfig},
 };
-use crate::domain::tunnel::{PortMapping, TunnelClientState, TunnelMode, TunnelServerState};
+use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::infra::DeployCenterClient;
-use crate::state::{LogHub, TaskStore};
+
+use super::log_hub::LogHub;
+use super::task_store::TaskStore;
+use super::tunnel_state::{TunnelClientState, TunnelServerState};
 
 /// 运行中的部署进程信息
 pub struct RunningDeploy {

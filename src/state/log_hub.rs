@@ -17,8 +17,6 @@ struct LogChannel {
     sender: broadcast::Sender<LogLine>,
     /// 创建时间
     created_at: DateTime<Utc>,
-    /// 是否已完成
-    finished: bool,
 }
 
 /// 日志中心
@@ -53,7 +51,6 @@ impl LogHub {
             LogChannel {
                 sender: sender.clone(),
                 created_at: Utc::now(),
-                finished: false,
             },
         );
 
@@ -62,7 +59,8 @@ impl LogHub {
 
     /// 订阅日志通道
     ///
-    /// 返回接收者，如果通道不存在或已完成返回 None
+    /// 返回接收者和一个标识通道是否仍然存在的 flag
+    /// 如果通道不存在返回 None
     pub async fn subscribe(&self, task_id: &str) -> Option<broadcast::Receiver<LogLine>> {
         let channels = self.channels.read().await;
         channels.get(task_id).map(|c| c.sender.subscribe())
@@ -74,20 +72,14 @@ impl LogHub {
         channels.get(task_id).map(|c| c.sender.clone())
     }
 
-    /// 标记通道完成
+    /// 完成并关闭通道
     ///
-    /// 通道完成后，SSE 客户端应收到完成事件并关闭连接
+    /// 移除通道并 drop sender，这会导致所有 receiver 收到 RecvError::Closed
+    /// SSE stream 可以据此发送 complete 事件并结束
     pub async fn finish(&self, task_id: &str) {
         let mut channels = self.channels.write().await;
-        if let Some(channel) = channels.get_mut(task_id) {
-            channel.finished = true;
-        }
-    }
-
-    /// 检查通道是否已完成
-    pub async fn is_finished(&self, task_id: &str) -> bool {
-        let channels = self.channels.read().await;
-        channels.get(task_id).map_or(true, |c| c.finished)
+        // 移除通道，sender 会被 drop，所有 receiver 将收到 Closed 错误
+        channels.remove(task_id);
     }
 
     /// 检查通道是否存在
@@ -96,36 +88,25 @@ impl LogHub {
         channels.contains_key(task_id)
     }
 
-    /// 清理已完成的通道
-    ///
-    /// 移除已完成且没有活跃订阅者的通道
-    pub async fn cleanup(&self) {
-        let mut channels = self.channels.write().await;
-        channels.retain(|_, channel| {
-            // 保留未完成的通道
-            if !channel.finished {
-                return true;
-            }
-            // 保留有活跃订阅者的通道
-            channel.sender.receiver_count() > 0
-        });
-    }
-
     /// 清理所有过期通道
     ///
-    /// 移除创建时间超过指定时长的已完成通道
+    /// 移除创建时间超过指定时长且没有活跃订阅者的通道
     pub async fn cleanup_expired(&self, max_age_hours: i64) {
         let now = Utc::now();
         let mut channels = self.channels.write().await;
 
-        channels.retain(|_, channel| {
+        channels.retain(|task_id, channel| {
             let age = now - channel.created_at;
             // 保留未过期的通道
             if age.num_hours() < max_age_hours {
                 return true;
             }
-            // 过期的通道只保留未完成且有订阅者的
-            !channel.finished || channel.sender.receiver_count() > 0
+            // 过期的通道：只保留有活跃订阅者的
+            let has_subscribers = channel.sender.receiver_count() > 0;
+            if !has_subscribers {
+                tracing::debug!(task_id = %task_id, "Removing expired log channel");
+            }
+            has_subscribers
         });
     }
 
@@ -133,12 +114,6 @@ impl LogHub {
     pub async fn count(&self) -> usize {
         let channels = self.channels.read().await;
         channels.len()
-    }
-
-    /// 获取活跃通道数量（未完成）
-    pub async fn active_count(&self) -> usize {
-        let channels = self.channels.read().await;
-        channels.values().filter(|c| !c.finished).count()
     }
 }
 
@@ -172,31 +147,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finish_and_cleanup() {
+    async fn test_finish_closes_channel() {
         let hub = LogHub::new();
 
         hub.create("task-1").await;
-        assert!(!hub.is_finished("task-1").await);
+        let mut receiver = hub.subscribe("task-1").await.unwrap();
 
+        // 完成通道
         hub.finish("task-1").await;
-        assert!(hub.is_finished("task-1").await);
 
-        // 没有订阅者时，cleanup 应该移除通道
-        hub.cleanup().await;
+        // 通道应该被移除
         assert!(!hub.exists("task-1").await);
+
+        // receiver 应该收到 Closed 错误
+        let result = receiver.recv().await;
+        assert!(matches!(
+            result,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[tokio::test]
-    async fn test_cleanup_preserves_active_subscribers() {
+    async fn test_finish_without_subscribers() {
         let hub = LogHub::new();
 
         hub.create("task-1").await;
-        let _receiver = hub.subscribe("task-1").await; // 保持订阅者存活
 
+        // 没有订阅者时完成通道
         hub.finish("task-1").await;
-        hub.cleanup().await;
 
-        // 有订阅者时，通道应该保留
-        assert!(hub.exists("task-1").await);
+        // 通道应该被移除
+        assert!(!hub.exists("task-1").await);
     }
 }

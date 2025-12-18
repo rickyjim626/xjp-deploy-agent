@@ -143,13 +143,16 @@ async fn trigger_deploy(
 ///
 /// GET /tasks/:task_id
 /// 无需认证
+///
+/// 注意：查询活跃任务和历史记录，已完成的任务也可以查到
 async fn get_task_status(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    // 使用 get_any 同时查询活跃任务和历史记录
     let task = state
         .task_store
-        .get(&task_id)
+        .get_any(&task_id)
         .await
         .ok_or_else(|| ApiError::not_found(format!("Task '{}'", task_id)))?;
 

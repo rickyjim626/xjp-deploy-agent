@@ -83,7 +83,7 @@ impl TunnelConfig {
             .unwrap_or_else(|_| "ws://localhost:9878/tunnel/ws".to_string());
 
         let port_mappings = env::var("TUNNEL_MAPPINGS")
-            .map(|v| PortMapping::parse_from_env(&v))
+            .map(|v| PortMapping::parse_mappings(&v))
             .unwrap_or_default();
 
         Self {

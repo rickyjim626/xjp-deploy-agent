@@ -56,10 +56,21 @@ impl TaskStore {
         task_id
     }
 
-    /// 获取任务
+    /// 获取活跃任务
     pub async fn get(&self, task_id: &str) -> Option<DeployTask> {
         let tasks = self.tasks.read().await;
         tasks.get(task_id).cloned()
+    }
+
+    /// 获取任务（优先活跃任务，然后查历史记录）
+    pub async fn get_any(&self, task_id: &str) -> Option<DeployTask> {
+        // 先查活跃任务
+        if let Some(task) = self.get(task_id).await {
+            return Some(task);
+        }
+        // 再查历史记录
+        let history = self.history.read().await;
+        history.iter().find(|t| t.id == task_id).cloned()
     }
 
     /// 获取所有活跃任务
