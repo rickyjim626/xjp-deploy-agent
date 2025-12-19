@@ -35,23 +35,28 @@ const POST_DEPLOY_MONITOR_SECONDS: u64 = 90;
 const MAX_RESTARTS_BEFORE_ALERT: u32 = 2;
 
 /// Extended fatal error patterns for Rust/Axum applications
+/// Note: Patterns are matched case-insensitively
 const FATAL_PATTERNS: &[&str] = &[
     // Original patterns
     "panic",
-    "fatal",
+    "fatal error",           // More specific than just "fatal"
     "segmentation fault",
     "core dumped",
     "killed",
     "out of memory",
-    // Rust/Axum specific
-    "overlapping",           // Route conflict
-    "already exists",        // Duplicate registration
+    "oom",
+    // Rust/Axum specific - route conflicts
+    "overlapping",           // Route conflict in Axum
     "route conflict",
+    "handler already registered",
+    "duplicate route",
+    // Rust panic patterns
     "thread.*panicked",
     "called `result::unwrap()` on an `err`",
     "called `option::unwrap()` on a `none`",
     "stack backtrace",
     "assertion failed",
+    "index out of bounds",
     // System signals
     "sigabrt",
     "sigsegv",
@@ -63,11 +68,22 @@ const FATAL_PATTERNS: &[&str] = &[
     "exit code 134",         // SIGABRT
     "exit code 139",         // SIGSEGV
     "exited with code 1",
-    // Database/Network
+    // Database/Network - actual errors only
     "connection refused",
-    "connection reset",
+    "connection reset by peer",
     "database.*unavailable",
     "migration failed",
+    "cannot start service",
+    "no such host",
+];
+
+/// Patterns to ignore even if they match FATAL_PATTERNS
+/// These are informational messages, not actual errors
+const IGNORE_PATTERNS: &[&str] = &[
+    "already exists, skipping",      // SQLx migration info
+    "if not exists",                 // CREATE IF NOT EXISTS
+    "or replace",                    // CREATE OR REPLACE
+    "on conflict",                   // UPSERT statements
 ];
 
 /// Execute a Docker Compose deployment with blue-green strategy
@@ -699,13 +715,27 @@ async fn check_logs_for_fatal_patterns(container: &str) -> Option<String> {
         .await;
 
     if let Ok(logs) = logs_result {
-        let stdout = String::from_utf8_lossy(&logs.stdout).to_lowercase();
-        let stderr = String::from_utf8_lossy(&logs.stderr).to_lowercase();
-        let combined = format!("{}{}", stdout, stderr);
+        let stdout = String::from_utf8_lossy(&logs.stdout);
+        let stderr = String::from_utf8_lossy(&logs.stderr);
 
-        for pattern in FATAL_PATTERNS {
-            if combined.contains(pattern) {
-                return Some(pattern.to_string());
+        // Check each line individually to properly handle ignore patterns
+        let all_lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
+
+        for line in all_lines {
+            let line_lower = line.to_lowercase();
+
+            // Skip lines that match ignore patterns (informational messages)
+            let should_ignore = IGNORE_PATTERNS.iter().any(|p| line_lower.contains(p));
+            if should_ignore {
+                continue;
+            }
+
+            // Check for fatal patterns
+            for pattern in FATAL_PATTERNS {
+                if line_lower.contains(pattern) {
+                    return Some(format!("{} (in: {})", pattern,
+                        if line.len() > 80 { &line[..80] } else { line }));
+                }
             }
         }
     }
