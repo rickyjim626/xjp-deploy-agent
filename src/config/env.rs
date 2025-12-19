@@ -114,6 +114,12 @@ pub mod constants {
     /// 最大活跃任务数
     pub const MAX_ACTIVE_TASKS: usize = 50;
 
+    /// 每个项目最大队列长度
+    pub const MAX_QUEUE_SIZE: usize = 10;
+
+    /// 队列任务超时时间（秒）- 等待超过此时间自动取消
+    pub const QUEUE_TIMEOUT_SECS: u64 = 600; // 10 分钟
+
     /// 版本号
     pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 }

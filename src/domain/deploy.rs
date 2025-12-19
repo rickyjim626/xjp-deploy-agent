@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployStatus {
+    /// 等待队列中
+    Queued,
     Running,
     Success,
     Failed,
@@ -16,6 +18,7 @@ impl DeployStatus {
     /// 转换为字符串
     pub fn as_str(&self) -> &'static str {
         match self {
+            DeployStatus::Queued => "queued",
             DeployStatus::Running => "running",
             DeployStatus::Success => "success",
             DeployStatus::Failed => "failed",
@@ -128,11 +131,29 @@ impl DeployTask {
         }
     }
 
+    /// 创建排队中的任务
+    pub fn new_queued(id: String, project: String) -> Self {
+        Self {
+            id,
+            project,
+            status: DeployStatus::Queued,
+            started_at: Utc::now(),
+            finished_at: None,
+            exit_code: None,
+            stages: Vec::new(),
+        }
+    }
+
     /// 设置任务完成
     pub fn complete(&mut self, status: DeployStatus, exit_code: Option<i32>) {
         self.status = status;
         self.finished_at = Some(Utc::now());
         self.exit_code = exit_code;
+    }
+
+    /// 设置任务状态
+    pub fn set_status(&mut self, status: DeployStatus) {
+        self.status = status;
     }
 }
 
@@ -230,6 +251,7 @@ mod tests {
 
     #[test]
     fn test_deploy_status_as_str() {
+        assert_eq!(DeployStatus::Queued.as_str(), "queued");
         assert_eq!(DeployStatus::Running.as_str(), "running");
         assert_eq!(DeployStatus::Success.as_str(), "success");
         assert_eq!(DeployStatus::Failed.as_str(), "failed");
@@ -237,6 +259,7 @@ mod tests {
 
     #[test]
     fn test_deploy_status_is_terminal() {
+        assert!(!DeployStatus::Queued.is_terminal());
         assert!(!DeployStatus::Running.is_terminal());
         assert!(DeployStatus::Success.is_terminal());
         assert!(DeployStatus::Failed.is_terminal());

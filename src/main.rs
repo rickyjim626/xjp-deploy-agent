@@ -9,8 +9,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use xjp_deploy_agent::{
     api,
-    config::env::constants::VERSION,
-    domain::tunnel::TunnelMode,
+    config::env::constants::{QUEUE_TIMEOUT_SECS, VERSION},
+    domain::{deploy::DeployStatus, tunnel::TunnelMode},
     services,
     state::AppState,
 };
@@ -61,12 +61,37 @@ async fn main() {
     {
         let state_clone = state.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60)); // 每分钟检查一次
             loop {
                 interval.tick().await;
-                state_clone.task_store.cleanup_stale().await;
-                state_clone.log_hub.cleanup_expired(24).await;
-                tracing::debug!("Completed periodic cleanup");
+
+                // 清理过期的队列项
+                let expired = state_clone
+                    .cleanup_expired_queue_items(QUEUE_TIMEOUT_SECS)
+                    .await;
+                for (project, task_id) in expired {
+                    // 标记超时任务为失败
+                    state_clone
+                        .task_store
+                        .update_status(&task_id, DeployStatus::Failed, Some(-1))
+                        .await;
+                    tracing::warn!(
+                        task_id = %task_id,
+                        project = %project,
+                        "Queue item expired after {} seconds",
+                        QUEUE_TIMEOUT_SECS
+                    );
+                }
+
+                // 清理过期的任务和日志（每小时执行一次）
+                static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count % 60 == 0 {
+                    // 每 60 分钟
+                    state_clone.task_store.cleanup_stale().await;
+                    state_clone.log_hub.cleanup_expired(24).await;
+                    tracing::debug!("Completed periodic cleanup");
+                }
             }
         });
     }

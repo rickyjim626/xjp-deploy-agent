@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::deploy::TriggerRequest;
 use crate::config::env::constants::{DEPLOY_TIMEOUT_SECS, HEARTBEAT_INTERVAL_SECS};
 use crate::config::project::ProjectConfig;
-use crate::domain::deploy::DeployType;
+use crate::domain::deploy::{DeployStatus, DeployType};
 use crate::state::AppState;
 
 pub use context::DeployContext;
@@ -26,6 +26,28 @@ pub use xiaojincut::XiaojincutConfig;
 ///
 /// 这是部署的主入口点，根据项目配置选择对应的部署策略
 pub async fn execute(
+    state: Arc<AppState>,
+    task_id: String,
+    project: String,
+    project_config: ProjectConfig,
+    request: TriggerRequest,
+) {
+    // 执行单个部署
+    execute_single(
+        state.clone(),
+        task_id,
+        project.clone(),
+        project_config,
+        request,
+    )
+    .await;
+
+    // 处理队列中的后续部署
+    process_queue(state, project).await;
+}
+
+/// 执行单个部署任务（不处理队列）
+async fn execute_single(
     state: Arc<AppState>,
     task_id: String,
     project: String,
@@ -117,6 +139,49 @@ pub async fn execute(
     // 取消辅助任务
     heartbeat_task.abort();
     timeout_task.abort();
+
+    // 取消注册当前部署
+    state.unregister_running_deploy(&project).await;
+}
+
+/// 处理队列中的后续部署
+async fn process_queue(state: Arc<AppState>, project: String) {
+    // 循环处理队列中的所有部署
+    loop {
+        // 从队列中取出下一个部署
+        let next = state.dequeue_deploy(&project).await;
+        let Some(next) = next else {
+            break;
+        };
+
+        tracing::info!(
+            task_id = %next.task_id,
+            project = %project,
+            "Starting queued deployment"
+        );
+
+        // 更新任务状态为 running
+        state
+            .task_store
+            .update_status(&next.task_id, DeployStatus::Running, None)
+            .await;
+
+        // 注册新的运行中部署
+        let _cancel_token = state.register_running_deploy(&project, &next.task_id).await;
+
+        // 创建日志通道
+        state.log_hub.create(&next.task_id).await;
+
+        // 执行部署
+        execute_single(
+            state.clone(),
+            next.task_id,
+            project.clone(),
+            next.project_config,
+            next.request,
+        )
+        .await;
+    }
 }
 
 /// 启动心跳任务

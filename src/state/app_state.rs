@@ -1,11 +1,12 @@
 //! 应用状态
 
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::api::deploy::TriggerRequest;
 use crate::config::{
     autoupdate::{AutoUpdateConfig, AutoUpdateState},
     env::EnvConfig,
@@ -22,6 +23,14 @@ use super::tunnel_state::{TunnelClientState, TunnelServerState};
 pub struct RunningDeploy {
     pub task_id: String,
     pub cancel_token: CancellationToken,
+}
+
+/// 队列中等待的部署请求
+pub struct QueuedDeploy {
+    pub task_id: String,
+    pub project_config: ProjectConfig,
+    pub request: TriggerRequest,
+    pub queued_at: DateTime<Utc>,
 }
 
 /// 应用状态
@@ -43,6 +52,8 @@ pub struct AppState {
     pub log_hub: LogHub,
     /// 每个项目当前运行中的部署 (project -> RunningDeploy)
     pub running_deploys: RwLock<HashMap<String, RunningDeploy>>,
+    /// 每个项目的部署队列 (project -> queue)
+    pub deploy_queue: RwLock<HashMap<String, VecDeque<QueuedDeploy>>>,
 
     // ========== 外部服务 ==========
     /// 部署中心客户端
@@ -102,6 +113,7 @@ impl AppState {
             task_store: TaskStore::new(),
             log_hub: LogHub::new(),
             running_deploys: RwLock::new(HashMap::new()),
+            deploy_queue: RwLock::new(HashMap::new()),
 
             deploy_center: DeployCenterClient::new(config.callback_url.clone()),
 
@@ -178,6 +190,70 @@ impl AppState {
     /// 获取回调 URL
     pub fn callback_url(&self) -> Option<&str> {
         self.config.callback_url.as_deref()
+    }
+
+    // ========== 队列管理方法 ==========
+
+    /// 将部署请求加入队列，返回队列位置（从 1 开始）
+    pub async fn enqueue_deploy(&self, project: &str, deploy: QueuedDeploy) -> usize {
+        let mut queue = self.deploy_queue.write().await;
+        let project_queue = queue.entry(project.to_string()).or_default();
+        project_queue.push_back(deploy);
+        project_queue.len()
+    }
+
+    /// 从队列中取出下一个部署请求
+    pub async fn dequeue_deploy(&self, project: &str) -> Option<QueuedDeploy> {
+        let mut queue = self.deploy_queue.write().await;
+        queue.get_mut(project).and_then(|q| q.pop_front())
+    }
+
+    /// 获取项目队列长度
+    pub async fn get_queue_length(&self, project: &str) -> usize {
+        let queue = self.deploy_queue.read().await;
+        queue.get(project).map_or(0, |q| q.len())
+    }
+
+    /// 获取任务在队列中的位置（从 1 开始，0 表示不在队列中）
+    pub async fn get_queue_position(&self, project: &str, task_id: &str) -> usize {
+        let queue = self.deploy_queue.read().await;
+        if let Some(project_queue) = queue.get(project) {
+            for (i, item) in project_queue.iter().enumerate() {
+                if item.task_id == task_id {
+                    return i + 1;
+                }
+            }
+        }
+        0
+    }
+
+    /// 清理超时的队列项，返回被清理的任务 ID 列表
+    pub async fn cleanup_expired_queue_items(&self, timeout_secs: u64) -> Vec<(String, String)> {
+        let mut queue = self.deploy_queue.write().await;
+        let now = Utc::now();
+        let mut expired = Vec::new();
+
+        for (project, items) in queue.iter_mut() {
+            let before_len = items.len();
+            items.retain(|item| {
+                let age = now - item.queued_at;
+                if age.num_seconds() > timeout_secs as i64 {
+                    expired.push((project.clone(), item.task_id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            if items.len() != before_len {
+                tracing::info!(
+                    project = %project,
+                    removed = before_len - items.len(),
+                    "Cleaned up expired queue items"
+                );
+            }
+        }
+
+        expired
     }
 }
 

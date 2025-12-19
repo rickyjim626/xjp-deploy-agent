@@ -17,14 +17,18 @@ use std::{convert::Infallible, sync::Arc};
 use tokio::sync::broadcast;
 use tracing::warn;
 
+use chrono::Utc;
+
+use crate::config::env::constants::MAX_QUEUE_SIZE;
 use crate::domain::deploy::DeployTask;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::RequireApiKey;
 use crate::services;
+use crate::state::app_state::QueuedDeploy;
 use crate::state::AppState;
 
 /// 触发部署请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TriggerRequest {
     /// 部署日志 ID（来自部署中心）
     pub deploy_log_id: Option<String>,
@@ -40,6 +44,9 @@ pub struct TriggerResponse {
     pub task_id: String,
     pub project: String,
     pub status: String,
+    /// 队列位置（仅当 status="queued" 时有值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
     pub stream_url: String,
 }
 
@@ -66,6 +73,16 @@ pub struct TaskHistoryResponse {
     pub total: usize,
 }
 
+/// 队列状态响应
+#[derive(Debug, Serialize)]
+pub struct QueueStatusResponse {
+    pub project: String,
+    /// 当前运行中的任务 ID
+    pub running_task_id: Option<String>,
+    /// 队列中等待的任务数
+    pub queue_length: usize,
+}
+
 /// 创建部署管理路由
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -74,6 +91,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tasks/recent", get(get_recent_tasks))
         .route("/logs/:task_id/stream", get(stream_logs))
         .route("/projects/:name/config", get(get_project_config))
+        .route("/queue/:project", get(get_queue_status))
 }
 
 /// 触发部署
@@ -108,20 +126,58 @@ async fn trigger_deploy(
             .ok_or_else(|| ApiError::bad_request("Invalid remote config: missing required fields"))?
     };
 
-    // 检查是否已有部署在运行
-    if state.has_running_deploy(&project).await {
-        return Err(ApiError::conflict(format!(
-            "Deployment for '{}' is already running",
-            project
-        )));
-    }
-
     // 使用传入的 deploy_log_id 作为 task_id（如果有的话），否则生成新的
     let task_id = request
         .deploy_log_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // 检查是否已有部署在运行
+    if state.has_running_deploy(&project).await {
+        // 检查队列是否已满
+        let queue_len = state.get_queue_length(&project).await;
+        if queue_len >= MAX_QUEUE_SIZE {
+            return Err(ApiError::conflict(format!(
+                "Deployment queue for '{}' is full (max {})",
+                project, MAX_QUEUE_SIZE
+            )));
+        }
+
+        // 创建排队中的任务
+        let task = DeployTask::new_queued(task_id.clone(), project.clone());
+        state.task_store.create(task).await;
+
+        // 加入队列
+        let position = state
+            .enqueue_deploy(
+                &project,
+                QueuedDeploy {
+                    task_id: task_id.clone(),
+                    project_config,
+                    request,
+                    queued_at: Utc::now(),
+                },
+            )
+            .await;
+
+        tracing::info!(
+            task_id = %task_id,
+            project = %project,
+            queue_position = position,
+            "Deployment queued"
+        );
+
+        // 返回排队响应
+        return Ok(Json(TriggerResponse {
+            task_id,
+            project,
+            status: "queued".to_string(),
+            queue_position: Some(position),
+            stream_url: String::new(), // 排队中暂无日志流
+        }));
+    }
+
+    // 没有运行中的部署，直接执行
     // 创建任务
     let task = DeployTask::new(task_id.clone(), project.clone());
     state.task_store.create(task).await;
@@ -137,6 +193,7 @@ async fn trigger_deploy(
         task_id: task_id.clone(),
         project: project.clone(),
         status: "running".to_string(),
+        queue_position: None,
         stream_url: format!("/logs/{}/stream", task_id),
     };
 
@@ -323,4 +380,22 @@ async fn get_project_config(
     }
 
     Err(ApiError::not_found(format!("Project '{}'", name)))
+}
+
+/// 获取队列状态
+///
+/// GET /queue/:project
+/// 无需认证
+async fn get_queue_status(
+    State(state): State<Arc<AppState>>,
+    Path(project): Path<String>,
+) -> impl IntoResponse {
+    let running_task_id = state.get_running_deploy_task_id(&project).await;
+    let queue_length = state.get_queue_length(&project).await;
+
+    Json(QueueStatusResponse {
+        project,
+        running_task_id,
+        queue_length,
+    })
 }
