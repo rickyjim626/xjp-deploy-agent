@@ -166,7 +166,8 @@ impl LogLine {
 }
 
 /// 部署类型
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeployType {
     /// 执行脚本（现有方式）
     Script { script: String },

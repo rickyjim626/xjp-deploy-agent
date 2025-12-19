@@ -5,7 +5,7 @@
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use std::sync::Arc;
@@ -27,6 +27,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/containers/:name/logs", get(get_container_logs))
         .route("/containers/:name/env", get(get_container_env))
         .route("/containers/:name/env/full", get(get_container_env_full))
+        .route("/containers/:name/restart", post(restart_container))
 }
 
 /// 列出所有容器
@@ -245,5 +246,56 @@ async fn get_container_env_internal(
     Ok(Json(ContainerEnvResponse {
         container: container_name.to_string(),
         env_vars,
+    }))
+}
+
+/// 重启容器响应
+#[derive(serde::Serialize)]
+pub struct RestartContainerResponse {
+    pub success: bool,
+    pub container: String,
+    pub message: String,
+}
+
+/// 重启容器
+///
+/// POST /containers/:name/restart
+/// 需要 API Key
+async fn restart_container(
+    _auth: RequireApiKey,
+    State(_state): State<Arc<AppState>>,
+    Path(container_name): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    tracing::info!(container = %container_name, "Restarting container");
+
+    let output = Command::new("docker")
+        .args(["restart", &container_name])
+        .output()
+        .await
+        .map_err(|e| {
+            error!(container = %container_name, error = %e, "Failed to restart container");
+            ApiError::internal(format!("Failed to restart container: {}", e))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No such container") {
+            return Err(ApiError::not_found(format!(
+                "Container '{}'",
+                container_name
+            )));
+        }
+        return Err(ApiError::internal(format!(
+            "Docker restart failed: {}",
+            stderr
+        )));
+    }
+
+    tracing::info!(container = %container_name, "Container restarted successfully");
+
+    Ok(Json(RestartContainerResponse {
+        success: true,
+        container: container_name,
+        message: "Container restarted successfully".to_string(),
     }))
 }

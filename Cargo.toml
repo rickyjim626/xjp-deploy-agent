@@ -1,13 +1,13 @@
 [package]
 name = "xjp-deploy-agent"
-version = "0.6.5"
+version = "0.6.13"
 edition = "2021"
 description = "Deploy agent for private cloud - triggers builds and streams logs"
 
 [dependencies]
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "net", "fs"] }
 
 # WebSocket client (for tunnel client mode)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

@@ -73,6 +73,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tasks/:task_id", get(get_task_status))
         .route("/tasks/recent", get(get_recent_tasks))
         .route("/logs/:task_id/stream", get(stream_logs))
+        .route("/projects/:name/config", get(get_project_config))
 }
 
 /// 触发部署
@@ -280,4 +281,46 @@ async fn stream_logs(
             .interval(std::time::Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+/// 项目配置响应
+#[derive(Debug, Serialize)]
+pub struct ProjectConfigResponse {
+    pub name: String,
+    pub work_dir: String,
+    pub deploy_type: String,
+    pub config: serde_json::Value,
+}
+
+/// 获取项目配置
+///
+/// GET /projects/:name/config
+/// 无需认证
+async fn get_project_config(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    // 先查本地配置
+    if let Some(config) = state.get_project(&name) {
+        return Ok(Json(ProjectConfigResponse {
+            name: name.clone(),
+            work_dir: config.work_dir.clone(),
+            deploy_type: config.deploy_type.name().to_string(),
+            config: serde_json::to_value(&config.deploy_type).unwrap_or_default(),
+        }));
+    }
+
+    // 尝试从部署中心获取
+    if let Some(remote_config) = state.deploy_center.fetch_config(&name).await {
+        if let Some(local_config) = remote_config.to_project_config() {
+            return Ok(Json(ProjectConfigResponse {
+                name: name.clone(),
+                work_dir: local_config.work_dir,
+                deploy_type: local_config.deploy_type.name().to_string(),
+                config: serde_json::to_value(&local_config.deploy_type).unwrap_or_default(),
+            }));
+        }
+    }
+
+    Err(ApiError::not_found(format!("Project '{}'", name)))
 }

@@ -42,9 +42,9 @@ async fn main() {
     // 3. 启动后台任务
     // 3.1 隧道客户端 (如果启用)
     if state.tunnel_mode == TunnelMode::Client {
-        let state_clone = state.clone();
+        let _state_clone = state.clone();
         tokio::spawn(async move {
-            // TODO: services::tunnel::client::start(state_clone).await;
+            // TODO: services::tunnel::client::start(_state_clone).await;
             tracing::info!("Tunnel client task - implementation pending");
         });
     }

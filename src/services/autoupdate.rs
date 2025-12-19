@@ -1,12 +1,42 @@
-//! 自动更新服务
+//! 自动更新服务 (蓝绿部署策略)
 //!
-//! 定期检查更新并自动应用
+//! 定期检查更新并使用蓝绿部署策略自动应用：
+//! 1. 下载新二进制到临时位置
+//! 2. 启动 canary 实例进行健康检查
+//! 3. 健康检查通过后替换并重启
+//! 4. 失败则保持当前版本
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 
-use crate::config::autoupdate::UpdateMetadata;
+use sha2::{Digest, Sha256};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use crate::config::autoupdate::{AutoUpdateConfig, UpdateMetadata};
 use crate::config::env::constants::VERSION;
 use crate::state::AppState;
+
+/// Canary 健康检查配置
+const CANARY_PORT: u16 = 19999;
+const CANARY_STARTUP_WAIT_SECS: u64 = 5;
+const CANARY_HEALTH_CHECK_TIMEOUT_SECS: u64 = 10;
+
+/// 手动触发更新（供 API 调用）
+pub async fn trigger_update(
+    state: Arc<AppState>,
+    config: AutoUpdateConfig,
+    metadata: UpdateMetadata,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(
+        version = %metadata.version,
+        "Manual update triggered via API"
+    );
+    download_and_apply_update(&state, &config, &metadata).await
+}
 
 /// 启动自动更新任务
 pub async fn start(state: Arc<AppState>) {
@@ -21,7 +51,7 @@ pub async fn start(state: Arc<AppState>) {
     tracing::info!(
         endpoint = %config.endpoint,
         check_interval = config.check_interval_secs,
-        "Starting auto-update task"
+        "Starting auto-update task (blue-green strategy)"
     );
 
     let mut interval =
@@ -46,10 +76,10 @@ pub async fn start(state: Arc<AppState>) {
     }
 }
 
-/// 检查并应用更新
+/// 检查并应用更新 (蓝绿部署)
 async fn check_and_apply_update(
     state: &Arc<AppState>,
-    config: &crate::config::autoupdate::AutoUpdateConfig,
+    config: &AutoUpdateConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 更新检查时间
     *state.auto_update_state.last_check.write().await = Some(chrono::Utc::now());
@@ -76,16 +106,274 @@ async fn check_and_apply_update(
     tracing::info!(
         current = VERSION,
         latest = %metadata.version,
-        "Update available"
+        "Update available, starting blue-green deployment"
     );
 
-    // TODO: 下载并应用更新
-    // download_and_apply_update(state, config, &metadata).await?;
-
-    *state.auto_update_state.last_check_result.write().await =
-        Some(format!("Update available: {}", metadata.version));
+    // 执行蓝绿部署更新
+    match download_and_apply_update(state, config, &metadata).await {
+        Ok(()) => {
+            *state.auto_update_state.last_check_result.write().await =
+                Some(format!("Successfully updated to {}", metadata.version));
+            tracing::info!(version = %metadata.version, "Update applied successfully");
+        }
+        Err(e) => {
+            *state.auto_update_state.last_check_result.write().await =
+                Some(format!("Update failed: {}", e));
+            tracing::error!(error = %e, "Failed to apply update");
+            return Err(e);
+        }
+    }
 
     Ok(())
+}
+
+/// 下载并应用更新 (蓝绿部署策略)
+async fn download_and_apply_update(
+    state: &Arc<AppState>,
+    config: &AutoUpdateConfig,
+    metadata: &UpdateMetadata,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let binary_url = config.binary_url(&metadata.version);
+
+    // Step 1: 下载新二进制
+    *state.auto_update_state.update_progress.write().await = "downloading".to_string();
+    tracing::info!(url = %binary_url, "Downloading new binary");
+
+    let temp_dir = std::env::temp_dir();
+    let temp_binary_path = temp_dir.join(format!("xjp-deploy-agent-{}", metadata.version));
+
+    download_binary(&binary_url, &temp_binary_path).await?;
+
+    // Step 2: 验证校验和 (如果有)
+    if let Some(ref expected_sha256) = metadata.sha256 {
+        *state.auto_update_state.update_progress.write().await = "verifying".to_string();
+        tracing::info!("Verifying checksum");
+
+        verify_checksum(&temp_binary_path, expected_sha256).await?;
+        tracing::info!("Checksum verified");
+    }
+
+    // Step 3: 蓝绿健康检查 - 启动 canary 实例
+    *state.auto_update_state.update_progress.write().await = "health_check".to_string();
+    tracing::info!("Starting canary health check");
+
+    let canary_healthy = run_canary_health_check(&temp_binary_path).await;
+
+    if !canary_healthy {
+        // 清理临时文件
+        let _ = fs::remove_file(&temp_binary_path).await;
+        *state.auto_update_state.update_progress.write().await = "none".to_string();
+        return Err("Canary health check failed - keeping current version".into());
+    }
+
+    tracing::info!("Canary health check passed");
+
+    // Step 4: 替换当前二进制
+    *state.auto_update_state.update_progress.write().await = "applying".to_string();
+    tracing::info!("Applying update - replacing binary");
+
+    let current_binary = std::env::current_exe()?;
+    let backup_binary = current_binary.with_extension("bak");
+
+    // 备份当前二进制
+    if current_binary.exists() {
+        fs::rename(&current_binary, &backup_binary).await?;
+    }
+
+    // 移动新二进制到当前位置
+    if let Err(e) = fs::rename(&temp_binary_path, &current_binary).await {
+        // 恢复备份
+        if backup_binary.exists() {
+            let _ = fs::rename(&backup_binary, &current_binary).await;
+        }
+        return Err(format!("Failed to replace binary: {}", e).into());
+    }
+
+    // 设置执行权限
+    fs::set_permissions(&current_binary, std::fs::Permissions::from_mode(0o755)).await?;
+
+    // 清理备份
+    let _ = fs::remove_file(&backup_binary).await;
+
+    *state.auto_update_state.update_progress.write().await = "restarting".to_string();
+    tracing::info!("Update applied, restarting...");
+
+    // Step 5: 重启进程
+    // 使用 exec 系统调用替换当前进程
+    restart_self(&current_binary).await?;
+
+    Ok(())
+}
+
+/// 下载二进制文件
+async fn download_binary(
+    url: &str,
+    dest: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = reqwest::get(url).await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status: {}", response.status()).into());
+    }
+
+    let bytes = response.bytes().await?;
+
+    let mut file = fs::File::create(dest).await?;
+    file.write_all(&bytes).await?;
+
+    // 设置执行权限
+    fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).await?;
+
+    tracing::info!(
+        path = %dest.display(),
+        size = bytes.len(),
+        "Binary downloaded"
+    );
+
+    Ok(())
+}
+
+/// 验证文件校验和
+async fn verify_checksum(
+    path: &PathBuf,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let contents = fs::read(path).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&contents);
+    let result = hasher.finalize();
+    let actual = format!("{:x}", result);
+
+    if actual != expected.to_lowercase() {
+        return Err(format!(
+            "Checksum mismatch: expected {}, got {}",
+            expected, actual
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// 运行 canary 健康检查
+///
+/// 启动新二进制进行健康检查，验证它能正常启动并响应
+async fn run_canary_health_check(binary_path: &PathBuf) -> bool {
+    tracing::info!(
+        path = %binary_path.display(),
+        port = CANARY_PORT,
+        "Starting canary instance for health check"
+    );
+
+    // 启动 canary 进程
+    // 注意：通过环境变量配置而不是 CLI 参数，因为 main.rs 不支持 CLI 参数
+    let canary_result = Command::new(binary_path)
+        .env("PORT", CANARY_PORT.to_string())
+        .env("AUTO_UPDATE_ENABLED", "false") // 禁用 canary 的自动更新
+        .env("DEPLOY_AGENT_API_KEY", "canary-health-check") // 提供必要的配置
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match canary_result {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to start canary process");
+            return false;
+        }
+    };
+
+    // 等待启动
+    tracing::info!(
+        wait_secs = CANARY_STARTUP_WAIT_SECS,
+        "Waiting for canary to start"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(CANARY_STARTUP_WAIT_SECS)).await;
+
+    // 检查进程是否还在运行
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            tracing::error!(
+                exit_code = ?status.code(),
+                "Canary process exited prematurely"
+            );
+            return false;
+        }
+        Ok(None) => {
+            // 进程还在运行，继续检查
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to check canary process status");
+            let _ = child.kill().await;
+            return false;
+        }
+    }
+
+    // 执行健康检查请求
+    let health_url = format!("http://127.0.0.1:{}/health", CANARY_PORT);
+    tracing::info!(url = %health_url, "Checking canary health endpoint");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(CANARY_HEALTH_CHECK_TIMEOUT_SECS))
+        .build()
+        .unwrap();
+
+    let health_check_result = client.get(&health_url).send().await;
+
+    // 无论结果如何，先终止 canary 进程
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    match health_check_result {
+        Ok(response) => {
+            if response.status().is_success() {
+                tracing::info!("Canary health check passed");
+                true
+            } else {
+                tracing::error!(
+                    status = %response.status(),
+                    "Canary health check failed with non-success status"
+                );
+                false
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Canary health check request failed");
+            false
+        }
+    }
+}
+
+/// 重启当前进程
+async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 获取当前进程的参数
+    let args: Vec<String> = std::env::args().collect();
+
+    tracing::info!(
+        binary = %binary_path.display(),
+        args = ?args,
+        "Restarting process"
+    );
+
+    // 在 Unix 系统上使用 exec 替换当前进程
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(binary_path)
+            .args(&args[1..])
+            .exec();
+        // 如果 exec 返回，说明出错了
+        return Err(format!("exec failed: {}", err).into());
+    }
+
+    // 在非 Unix 系统上，生成新进程然后退出
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(binary_path)
+            .args(&args[1..])
+            .spawn()?;
+        std::process::exit(0);
+    }
 }
 
 /// 获取更新元数据
