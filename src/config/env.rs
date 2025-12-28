@@ -184,12 +184,9 @@ impl FrpConfig {
         let admin_user = env::var("FRP_ADMIN_USER").ok().filter(|s| !s.is_empty());
         let admin_pwd = env::var("FRP_ADMIN_PWD").ok().filter(|s| !s.is_empty());
 
-        // If enabled not set explicitly, auto-enable when tunnel mode is client and mappings exist.
-        let enabled = if enabled {
-            true
-        } else {
-            tunnel.mode == TunnelMode::Client && !tunnel.port_mappings.is_empty()
-        };
+        // FRP is only enabled when explicitly set via FRP_ENABLED=true
+        // WebSocket tunnel (TUNNEL_MODE=client) is now the preferred method
+        let enabled = enabled;
 
         Self {
             enabled,
