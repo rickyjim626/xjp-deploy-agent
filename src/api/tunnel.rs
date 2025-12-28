@@ -35,6 +35,21 @@ async fn get_tunnel_status(
     _auth: RequireApiKey,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // If we are using managed FRP (frpc), expose status via the same tunnel endpoint for
+    // backward compatibility.
+    if let Some(frp) = &state.frp {
+        let frp_status = frp.status().await;
+        return Json(TunnelStatusResponse::Client(TunnelClientStatus {
+            connected: frp_status.running,
+            server_url: format!("{}:{}", frp_status.server_addr, frp_status.server_port),
+            connected_at: frp_status.started_at,
+            last_error: frp_status.last_error,
+            reconnect_count: frp_status.restart_count,
+            mappings: frp_status.mappings,
+        }))
+        .into_response();
+    }
+
     let response = match &state.tunnel_mode {
         TunnelMode::Server => {
             let server_state = &state.tunnel_server_state;
@@ -99,7 +114,7 @@ async fn get_tunnel_status(
         TunnelMode::Disabled => TunnelStatusResponse::Disabled,
     };
 
-    Json(response)
+    Json(response).into_response()
 }
 
 /// WebSocket 隧道端点 (Server 模式)

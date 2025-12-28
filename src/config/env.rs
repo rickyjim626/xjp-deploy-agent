@@ -17,6 +17,10 @@ pub struct EnvConfig {
     pub port: u16,
     /// 隧道配置
     pub tunnel: TunnelConfig,
+    /// NFA 服务配置（Windows 节点）
+    pub nfa: NfaConfig,
+    /// FRP 客户端配置（由 deploy-agent 托管 frpc）
+    pub frp: FrpConfig,
     /// 自动更新配置
     pub auto_update: Option<AutoUpdateConfig>,
 }
@@ -56,6 +60,12 @@ impl EnvConfig {
         // Tunnel config
         let tunnel = TunnelConfig::from_env();
 
+        // NFA config
+        let nfa = NfaConfig::from_env();
+
+        // FRP config
+        let frp = FrpConfig::from_env(&tunnel);
+
         // Auto update config
         let auto_update = AutoUpdateConfig::from_env();
 
@@ -64,7 +74,133 @@ impl EnvConfig {
             callback_url,
             port,
             tunnel,
+            nfa,
+            frp,
             auto_update,
+        }
+    }
+}
+
+/// NFA 配置
+#[derive(Clone, Debug)]
+pub struct NfaConfig {
+    pub enabled: bool,
+    pub auto_start: bool,
+    pub python_path: String,
+    pub script_path: String,
+    pub port: u16,
+    pub max_concurrent: usize,
+    pub poll_interval_ms: u64,
+    pub job_timeout_secs: u64,
+    pub restart_backoff_ms: u64,
+}
+
+impl NfaConfig {
+    pub fn from_env() -> Self {
+        let enabled = env::var("NFA_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let auto_start = env::var("NFA_AUTO_START")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
+        let python_path = env::var("NFA_PYTHON_PATH").unwrap_or_else(|_| "python".to_string());
+        let script_path = env::var("NFA_SCRIPT_PATH")
+            .unwrap_or_else(|_| "C:\\alignment-service\\nfa_service.py".to_string());
+
+        let port = env::var("NFA_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9528);
+
+        let max_concurrent = env::var("NFA_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
+        let poll_interval_ms = env::var("NFA_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(800);
+
+        let job_timeout_secs = env::var("NFA_JOB_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        let restart_backoff_ms = env::var("NFA_RESTART_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500);
+
+        Self {
+            enabled,
+            auto_start,
+            python_path,
+            script_path,
+            port,
+            max_concurrent,
+            poll_interval_ms,
+            job_timeout_secs,
+            restart_backoff_ms,
+        }
+    }
+}
+
+/// FRP 配置（托管 frpc）
+#[derive(Clone, Debug)]
+pub struct FrpConfig {
+    pub enabled: bool,
+    pub frpc_path: String,
+    pub server_addr: String,
+    pub server_port: u16,
+    pub token: Option<String>,
+    pub admin_addr: String,
+    pub admin_port: u16,
+    pub admin_user: Option<String>,
+    pub admin_pwd: Option<String>,
+}
+
+impl FrpConfig {
+    pub fn from_env(tunnel: &TunnelConfig) -> Self {
+        let enabled = env::var("FRP_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let frpc_path = env::var("FRPC_PATH").unwrap_or_else(|_| "frpc".to_string());
+        let server_addr = env::var("FRP_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let server_port = env::var("FRP_SERVER_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7000);
+        let token = env::var("FRP_TOKEN").ok().filter(|s| !s.is_empty());
+
+        let admin_addr = env::var("FRP_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let admin_port = env::var("FRP_ADMIN_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7400);
+        let admin_user = env::var("FRP_ADMIN_USER").ok().filter(|s| !s.is_empty());
+        let admin_pwd = env::var("FRP_ADMIN_PWD").ok().filter(|s| !s.is_empty());
+
+        // If enabled not set explicitly, auto-enable when tunnel mode is client and mappings exist.
+        let enabled = if enabled {
+            true
+        } else {
+            tunnel.mode == TunnelMode::Client && !tunnel.port_mappings.is_empty()
+        };
+
+        Self {
+            enabled,
+            frpc_path,
+            server_addr,
+            server_port,
+            token,
+            admin_addr,
+            admin_port,
+            admin_user,
+            admin_pwd,
         }
     }
 }

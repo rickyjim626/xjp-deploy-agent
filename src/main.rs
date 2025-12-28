@@ -40,8 +40,22 @@ async fn main() {
     );
 
     // 3. 启动后台任务
-    // 3.1 隧道客户端 (如果启用)
-    if state.tunnel_mode == TunnelMode::Client {
+    // 3.1 NFA supervisor (Windows 节点)
+    if let Some(nfa) = &state.nfa {
+        let nfa_clone = nfa.clone();
+        tokio::spawn(async move {
+            nfa_clone.supervise().await;
+        });
+    }
+
+    // 3.2 FRP client (托管 frpc)
+    if let Some(frp) = &state.frp {
+        let frp_clone = frp.clone();
+        tokio::spawn(async move {
+            frp_clone.supervise().await;
+        });
+    } else if state.tunnel_mode == TunnelMode::Client {
+        // Legacy WebSocket tunnel (deprecated; kept for backward compatibility)
         let _state_clone = state.clone();
         tokio::spawn(async move {
             // TODO: services::tunnel::client::start(_state_clone).await;
@@ -49,7 +63,7 @@ async fn main() {
         });
     }
 
-    // 3.2 自动更新 (如果启用)
+    // 3.3 自动更新 (如果启用)
     if state.auto_update_config.is_some() {
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -57,7 +71,7 @@ async fn main() {
         });
     }
 
-    // 3.3 定期清理任务
+    // 3.4 定期清理任务
     {
         let state_clone = state.clone();
         tokio::spawn(async move {

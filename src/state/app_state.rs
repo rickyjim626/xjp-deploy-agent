@@ -14,6 +14,7 @@ use crate::config::{
 };
 use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::infra::DeployCenterClient;
+use crate::services::{frp::FrpcManager, nfa::NfaSupervisor};
 
 use super::log_hub::LogHub;
 use super::task_store::TaskStore;
@@ -73,6 +74,12 @@ pub struct AppState {
     /// 隧道服务端 URL (Client 模式)
     pub tunnel_server_url: String,
 
+    // ========== NFA / FRP ==========
+    /// NFA supervisor (Windows 节点，可选)
+    pub nfa: Option<Arc<NfaSupervisor>>,
+    /// FRP client manager (托管 frpc，可选)
+    pub frp: Option<Arc<FrpcManager>>,
+
     // ========== 自动更新 ==========
     /// 自动更新配置
     pub auto_update_config: Option<AutoUpdateConfig>,
@@ -105,6 +112,21 @@ impl AppState {
             );
         }
 
+        let nfa = if config.nfa.enabled {
+            Some(Arc::new(NfaSupervisor::new(config.nfa.clone())))
+        } else {
+            None
+        };
+
+        let frp = if config.frp.enabled {
+            Some(Arc::new(FrpcManager::new(
+                config.frp.clone(),
+                config.tunnel.port_mappings.clone(),
+            )))
+        } else {
+            None
+        };
+
         Self {
             api_key: config.api_key.clone(),
             projects,
@@ -123,6 +145,9 @@ impl AppState {
             tunnel_client_state: Arc::new(TunnelClientState::new()),
             tunnel_port_mappings: config.tunnel.port_mappings.clone(),
             tunnel_server_url: config.tunnel.server_url.clone(),
+
+            nfa,
+            frp,
 
             auto_update_config: config.auto_update.clone(),
             auto_update_state: Arc::new(AutoUpdateState::new()),
