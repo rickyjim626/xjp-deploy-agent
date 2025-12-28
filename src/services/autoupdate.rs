@@ -6,6 +6,7 @@
 //! 3. 健康检查通过后替换并重启
 //! 4. 失败则保持当前版本
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -189,7 +190,8 @@ async fn download_and_apply_update(
         return Err(format!("Failed to replace binary: {}", e).into());
     }
 
-    // 设置执行权限
+    // 设置执行权限 (Unix only)
+    #[cfg(unix)]
     fs::set_permissions(&current_binary, std::fs::Permissions::from_mode(0o755)).await?;
 
     // 清理备份
@@ -221,7 +223,8 @@ async fn download_binary(
     let mut file = fs::File::create(dest).await?;
     file.write_all(&bytes).await?;
 
-    // 设置执行权限
+    // 设置执行权限 (Unix only)
+    #[cfg(unix)]
     fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).await?;
 
     tracing::info!(
