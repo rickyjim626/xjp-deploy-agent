@@ -6,7 +6,4 @@ pub mod deploy;
 pub mod autoupdate;
 pub mod frp;
 pub mod nfa;
-
-// TODO: 后续迁移
-// pub mod database;
-// pub mod tunnel;
+pub mod tunnel;

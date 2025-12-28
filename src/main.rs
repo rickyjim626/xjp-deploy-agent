@@ -55,11 +55,10 @@ async fn main() {
             frp_clone.supervise().await;
         });
     } else if state.tunnel_mode == TunnelMode::Client {
-        // Legacy WebSocket tunnel (deprecated; kept for backward compatibility)
-        let _state_clone = state.clone();
+        // WebSocket 隧道客户端
+        let state_clone = state.clone();
         tokio::spawn(async move {
-            // TODO: services::tunnel::client::start(_state_clone).await;
-            tracing::info!("Tunnel client task - implementation pending");
+            services::tunnel::client::start(state_clone).await;
         });
     }
 

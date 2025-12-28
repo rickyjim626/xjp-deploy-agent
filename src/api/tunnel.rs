@@ -156,14 +156,10 @@ async fn tunnel_websocket_handler(
 }
 
 /// 处理 Server 端的隧道连接
-///
-/// TODO: 完整实现移至 services/tunnel/server.rs
 async fn handle_tunnel_server_connection(
-    _socket: WebSocket,
-    _state: Arc<AppState>,
-    _client_addr: String,
+    socket: WebSocket,
+    state: Arc<AppState>,
+    client_addr: String,
 ) {
-    // TODO: 实现完整的隧道服务端逻辑
-    // 当前只是占位符，完整实现将在 services 层
-    tracing::info!("Tunnel connection handler - implementation pending in services layer");
+    crate::services::tunnel::server::handle_connection(socket, state, client_addr).await;
 }
