@@ -33,6 +33,8 @@ pub struct NfaAlignRequest {
     pub refine_boundaries: Option<bool>,
     #[serde(default)]
     pub fail_on_low_coverage: Option<bool>,
+    #[serde(default)]
+    pub audio_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

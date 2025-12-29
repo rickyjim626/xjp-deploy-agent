@@ -262,6 +262,8 @@ async fn handle_server_message(
                 if let Err(e) = tx.send(data).await {
                     debug!(conn_id = %conn_id, error = %e, "Failed to forward data to local connection");
                 }
+            } else {
+                warn!(conn_id = %conn_id, data_len = data.len(), "Received data for unknown conn_id (connection not ready yet or already closed)");
             }
         }
 
