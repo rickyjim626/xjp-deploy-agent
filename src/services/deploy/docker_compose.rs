@@ -21,6 +21,8 @@ pub struct DockerComposeConfig {
     pub image: String,
     pub git_repo_dir: Option<String>,
     pub service: Option<String>,
+    /// Health check port (default 8081, BFF uses 3001)
+    pub health_port: Option<u16>,
 }
 
 /// Health check configuration
@@ -240,6 +242,8 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
         ctx.log_stdout("[3/4] Running canary health check...").await;
 
         // Run canary health check using docker-compose to inherit env vars
+        // Default health port is 8081 (backend), BFF uses 3001
+        let health_port = config.health_port.unwrap_or(8081);
         let canary_result = run_canary_health_check(
             ctx,
             &config.image,
@@ -248,6 +252,7 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
             config.service.as_deref(),
             docker_compose_cmd,
             &docker_compose_args,
+            health_port,
         )
         .await;
 
@@ -480,6 +485,7 @@ async fn run_canary_health_check(
     service: Option<&str>,
     docker_compose_cmd: &str,
     docker_compose_args: &[&str],
+    health_port: u16,
 ) -> Result<(), String> {
     // Clean up any existing canary container
     ctx.log_stdout(">>> Cleaning up any existing canary container...")
@@ -491,10 +497,11 @@ async fn run_canary_health_check(
 
     // Use docker-compose run to start canary with correct environment
     let service_name = service.unwrap_or("xjp-backend");
+    let port_mapping = format!("19999:{}", health_port);
 
     ctx.log_stdout(&format!(
-        ">>> {} -f {} run -d --name {} --no-deps -p 19999:8081 {}",
-        docker_compose_cmd, compose_path, CANARY_CONTAINER_NAME, service_name
+        ">>> {} -f {} run -d --name {} --no-deps -p {} {}",
+        docker_compose_cmd, compose_path, CANARY_CONTAINER_NAME, port_mapping, service_name
     ))
     .await;
 
@@ -504,7 +511,7 @@ async fn run_canary_health_check(
         "run", "-d",
         "--name", CANARY_CONTAINER_NAME,
         "--no-deps",
-        "-p", "19999:8081",
+        "-p", &port_mapping,
         service_name,
     ]);
 

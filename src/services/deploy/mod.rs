@@ -91,12 +91,14 @@ async fn execute_single(
             image,
             git_repo_dir,
             service,
+            health_port,
         } => {
             let config = DockerComposeConfig {
                 compose_file,
                 image,
                 git_repo_dir,
                 service,
+                health_port,
             };
             docker_compose::execute(&ctx, &project_config.work_dir, config).await;
         }

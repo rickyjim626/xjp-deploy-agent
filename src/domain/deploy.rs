@@ -202,6 +202,8 @@ pub enum DeployType {
         git_repo_dir: Option<String>,
         /// 要重启的服务名称（如果不指定则重启所有服务）
         service: Option<String>,
+        /// 健康检查端口（默认 8081，BFF 使用 3001）
+        health_port: Option<u16>,
     },
     /// Docker Build 部署（拉取代码、构建镜像、推送到 registry）
     DockerBuild {

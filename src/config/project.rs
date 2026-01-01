@@ -42,6 +42,8 @@ pub struct RemoteAgentConfig {
     pub compose_file: Option<String>,
     /// Service name to restart (for docker_compose type)
     pub services: Option<Vec<String>>,
+    /// Health check port for docker_compose canary (default 8081, BFF uses 3001)
+    pub health_port: Option<u16>,
     /// Environment variables
     pub env: Option<HashMap<String, String>>,
     /// Timeout in seconds
@@ -90,6 +92,7 @@ impl RemoteAgentConfig {
                     image,
                     git_repo_dir: Some(work_dir.clone()),
                     service: self.services.as_ref().and_then(|s| s.first().cloned()),
+                    health_port: self.health_port,
                 }
             }
             "xiaojincut" => DeployType::Xiaojincut {
@@ -167,6 +170,12 @@ pub fn load_projects_from_env() -> HashMap<String, ProjectConfig> {
                             name.to_uppercase().replace('-', "_")
                         ))
                         .ok();
+                        let health_port = env::var(format!(
+                            "PROJECT_{}_HEALTH_PORT",
+                            name.to_uppercase().replace('-', "_")
+                        ))
+                        .ok()
+                        .and_then(|v| v.parse().ok());
 
                         if let Some(image) = image {
                             DeployType::DockerCompose {
@@ -174,6 +183,7 @@ pub fn load_projects_from_env() -> HashMap<String, ProjectConfig> {
                                 image,
                                 git_repo_dir: git_repo,
                                 service,
+                                health_port,
                             }
                         } else {
                             continue; // 跳过没有 image 的 docker_compose 项目
