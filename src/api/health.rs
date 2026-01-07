@@ -15,6 +15,7 @@ use crate::config::autoupdate::AutoUpdateStatus;
 use crate::config::env::constants::VERSION;
 use crate::error::ApiResult;
 use crate::middleware::RequireApiKey;
+use crate::services::nfa::NfaStatus;
 use crate::state::AppState;
 
 /// 健康检查响应
@@ -29,6 +30,8 @@ struct HealthResponse {
     active_projects: Vec<String>,
     auto_update_enabled: bool,
     auto_update: AutoUpdateStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nfa: Option<NfaStatus>,
 }
 
 /// 重启响应
@@ -81,6 +84,13 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .tap_mut(|s| s.enabled = legacy_enabled)
     };
 
+    // 获取 NFA 状态（如果启用）
+    let nfa_status = if let Some(nfa) = &state.nfa {
+        Some(nfa.status().await)
+    } else {
+        None
+    };
+
     Json(HealthResponse {
         status: "ok",
         service: "xjp-deploy-agent",
@@ -91,6 +101,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         active_projects,
         auto_update_enabled: auto_update_status.enabled,
         auto_update: auto_update_status,
+        nfa: nfa_status,
     })
 }
 
