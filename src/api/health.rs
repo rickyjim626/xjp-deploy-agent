@@ -13,10 +13,25 @@ use std::sync::Arc;
 
 use crate::config::autoupdate::AutoUpdateStatus;
 use crate::config::env::constants::VERSION;
+use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::error::ApiResult;
 use crate::middleware::RequireApiKey;
 use crate::services::nfa::NfaStatus;
 use crate::state::AppState;
+
+/// 隧道状态摘要（用于 health 端点）
+#[derive(Debug, Serialize)]
+struct TunnelStatusSummary {
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_connected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_addr: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    port_mappings: Vec<PortMapping>,
+}
 
 /// 健康检查响应
 #[derive(Debug, Serialize)]
@@ -32,6 +47,8 @@ struct HealthResponse {
     auto_update: AutoUpdateStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     nfa: Option<NfaStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel: Option<TunnelStatusSummary>,
 }
 
 /// 重启响应
@@ -91,6 +108,35 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         None
     };
 
+    // 获取隧道状态
+    let tunnel_status = match &state.tunnel_mode {
+        TunnelMode::Server => {
+            let server_state = &state.tunnel_server_state;
+            let client_connected = *server_state.client_connected.read().await;
+            let client_addr = server_state.client_addr.read().await.clone();
+            let client_mappings = server_state.client_mappings.read().await.clone();
+            Some(TunnelStatusSummary {
+                mode: "server".to_string(),
+                server_url: None,
+                client_connected: Some(client_connected),
+                client_addr: if client_connected { client_addr } else { None },
+                port_mappings: client_mappings,
+            })
+        }
+        TunnelMode::Client => {
+            let client_state = &state.tunnel_client_state;
+            let connected = *client_state.connected.read().await;
+            Some(TunnelStatusSummary {
+                mode: "client".to_string(),
+                server_url: Some(state.tunnel_server_url.clone()),
+                client_connected: Some(connected),
+                client_addr: None,
+                port_mappings: state.tunnel_port_mappings.clone(),
+            })
+        }
+        TunnelMode::Disabled => None,
+    };
+
     Json(HealthResponse {
         status: "ok",
         service: "xjp-deploy-agent",
@@ -102,6 +148,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         auto_update_enabled: auto_update_status.enabled,
         auto_update: auto_update_status,
         nfa: nfa_status,
+        tunnel: tunnel_status,
     })
 }
 
