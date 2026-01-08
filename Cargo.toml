@@ -1,6 +1,6 @@
 [package]
 name = "xjp-deploy-agent"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 description = "Deploy agent for private cloud - triggers builds and streams logs"
 
@@ -43,6 +43,9 @@ async-stream = "0.3"
 
 # System information
 sysinfo = "0.32"
+
+# Environment file loading
+dotenvy = "0.15"
 
 # SHA256 for update verification
 sha2 = "0.10"

@@ -17,6 +17,35 @@ use xjp_deploy_agent::{
 
 #[tokio::main]
 async fn main() {
+    // 0. 加载 .env 文件（如果存在）
+    // 按优先级尝试多个位置：当前目录 -> 可执行文件目录
+    let env_paths = [
+        std::path::PathBuf::from("config.env"),
+        std::path::PathBuf::from(".env"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("config.env")))
+            .unwrap_or_default(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(".env")))
+            .unwrap_or_default(),
+    ];
+
+    for path in &env_paths {
+        if path.exists() {
+            match dotenvy::from_path(path) {
+                Ok(_) => {
+                    eprintln!("[init] Loaded env from: {}", path.display());
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[init] Failed to load {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
     // 1. 初始化日志
     tracing_subscriber::registry()
         .with(
