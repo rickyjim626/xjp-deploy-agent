@@ -4,6 +4,7 @@ use std::env;
 use tracing::warn;
 
 use crate::config::autoupdate::AutoUpdateConfig;
+use crate::domain::ssh::SshConfig;
 use crate::domain::tunnel::{PortMapping, TunnelMode};
 
 /// 环境配置
@@ -23,6 +24,8 @@ pub struct EnvConfig {
     pub frp: FrpConfig,
     /// 自动更新配置
     pub auto_update: Option<AutoUpdateConfig>,
+    /// SSH 服务器配置
+    pub ssh: SshConfig,
 }
 
 /// 隧道配置
@@ -71,6 +74,9 @@ impl EnvConfig {
         // Auto update config
         let auto_update = AutoUpdateConfig::from_env();
 
+        // SSH config
+        let ssh = SshConfig::from_env();
+
         Self {
             api_key,
             callback_url,
@@ -79,6 +85,7 @@ impl EnvConfig {
             nfa,
             frp,
             auto_update,
+            ssh,
         }
     }
 }
@@ -164,7 +171,7 @@ pub struct FrpConfig {
 }
 
 impl FrpConfig {
-    pub fn from_env(tunnel: &TunnelConfig) -> Self {
+    pub fn from_env(_tunnel: &TunnelConfig) -> Self {
         let enabled = env::var("FRP_ENABLED")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

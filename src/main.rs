@@ -11,7 +11,7 @@ use xjp_deploy_agent::{
     api,
     config::env::constants::{QUEUE_TIMEOUT_SECS, VERSION},
     domain::{deploy::DeployStatus, tunnel::TunnelMode},
-    services,
+    services::{self, ssh::SshServer},
     state::AppState,
 };
 
@@ -45,6 +45,26 @@ async fn main() {
         let nfa_clone = nfa.clone();
         tokio::spawn(async move {
             nfa_clone.supervise().await;
+        });
+    }
+
+    // 3.1.1 SSH 服务器 (如果启用)
+    if state.config.ssh.enabled {
+        let ssh_config = state.config.ssh.clone();
+        let api_key = state.config.api_key.clone();
+        tokio::spawn(async move {
+            match SshServer::new(ssh_config.clone(), api_key).await {
+                Ok(server) => {
+                    tracing::info!(port = ssh_config.port, "SSH server starting");
+                    let server = Arc::new(server);
+                    if let Err(e) = server.run().await {
+                        tracing::error!(error = %e, "SSH server error");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create SSH server");
+                }
+            }
         });
     }
 

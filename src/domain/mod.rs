@@ -6,6 +6,7 @@ pub mod code;
 pub mod container;
 pub mod database;
 pub mod deploy;
+pub mod ssh;
 pub mod system;
 pub mod tunnel;
 
