@@ -373,6 +373,7 @@ async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::E
     #[cfg(windows)]
     {
         restart_self_windows(binary_path, &args).await?;
+        return Ok(()); // Windows 函数处理了退出
     }
 
     #[cfg(not(any(unix, windows)))]
