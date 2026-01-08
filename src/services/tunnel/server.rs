@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -253,6 +256,81 @@ async fn handle_client_message(
 
         TunnelMessage::Connect { .. } => {
             warn!("Unexpected Connect message from client");
+        }
+
+        TunnelMessage::HttpRequest { .. } => {
+            warn!("Unexpected HttpRequest message from client");
+        }
+
+        TunnelMessage::HttpResponse {
+            request_id,
+            status,
+            headers,
+            body,
+        } => {
+            debug!(request_id = %request_id, status = status, "Received HTTP response from client");
+
+            // 查找等待的请求
+            let sender = {
+                let mut pending = state.tunnel_server_state.pending_http_requests.write().await;
+                pending.remove(&request_id)
+            };
+
+            if let Some(tx) = sender {
+                // 构建 HTTP 响应
+                let mut response_builder = Response::builder().status(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                );
+
+                for (name, value) in headers {
+                    response_builder = response_builder.header(name, value);
+                }
+
+                let response = match body {
+                    Some(data) => response_builder
+                        .body(Body::from(data))
+                        .unwrap_or_else(|_| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response")
+                                .into_response()
+                        }),
+                    None => response_builder
+                        .body(Body::empty())
+                        .unwrap_or_else(|_| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response")
+                                .into_response()
+                        }),
+                };
+
+                if tx.send(response).is_err() {
+                    warn!(request_id = %request_id, "Failed to send HTTP response - receiver dropped");
+                }
+            } else {
+                warn!(request_id = %request_id, "No pending request found for HTTP response");
+            }
+        }
+
+        TunnelMessage::HttpError { request_id, error } => {
+            warn!(request_id = %request_id, error = %error, "Received HTTP error from client");
+
+            let sender = {
+                let mut pending = state.tunnel_server_state.pending_http_requests.write().await;
+                pending.remove(&request_id)
+            };
+
+            if let Some(tx) = sender {
+                let response = (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({
+                        "error": "proxy_error",
+                        "message": error
+                    })),
+                )
+                    .into_response();
+
+                if tx.send(response).is_err() {
+                    warn!(request_id = %request_id, "Failed to send HTTP error response");
+                }
+            }
         }
     }
 }

@@ -281,6 +281,101 @@ async fn handle_server_message(
             debug!("Received pong");
         }
 
+        TunnelMessage::HttpRequest {
+            request_id,
+            method,
+            path,
+            headers,
+            body,
+        } => {
+            debug!(request_id = %request_id, method = %method, path = %path, "Received HTTP proxy request");
+
+            let ws_tx_clone = ws_tx.clone();
+            tokio::spawn(async move {
+                // 默认代理到本地 deploy-agent API (localhost:9876)
+                let local_url = format!("http://127.0.0.1:9876{}", path);
+
+                let client = reqwest::Client::new();
+                let method = match method.as_str() {
+                    "GET" => reqwest::Method::GET,
+                    "POST" => reqwest::Method::POST,
+                    "PUT" => reqwest::Method::PUT,
+                    "DELETE" => reqwest::Method::DELETE,
+                    "PATCH" => reqwest::Method::PATCH,
+                    "HEAD" => reqwest::Method::HEAD,
+                    "OPTIONS" => reqwest::Method::OPTIONS,
+                    _ => reqwest::Method::GET,
+                };
+
+                let mut request = client.request(method, &local_url);
+
+                // 添加 headers
+                for (name, value) in headers {
+                    request = request.header(&name, &value);
+                }
+
+                // 添加 body
+                if let Some(data) = body {
+                    request = request.body(data);
+                }
+
+                // 发送请求
+                match request.send().await {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let response_headers: Vec<(String, String)> = response
+                            .headers()
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|v| (name.as_str().to_string(), v.to_string()))
+                            })
+                            .collect();
+
+                        // 读取 body
+                        match response.bytes().await {
+                            Ok(bytes) => {
+                                let body_data = if bytes.is_empty() {
+                                    None
+                                } else {
+                                    Some(bytes.to_vec())
+                                };
+
+                                let _ = ws_tx_clone
+                                    .send(TunnelMessage::HttpResponse {
+                                        request_id,
+                                        status,
+                                        headers: response_headers,
+                                        body: body_data,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to read response body");
+                                let _ = ws_tx_clone
+                                    .send(TunnelMessage::HttpError {
+                                        request_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, local_url = %local_url, "Failed to make local HTTP request");
+                        let _ = ws_tx_clone
+                            .send(TunnelMessage::HttpError {
+                                request_id,
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+
         _ => {
             debug!(?msg, "Ignoring message");
         }

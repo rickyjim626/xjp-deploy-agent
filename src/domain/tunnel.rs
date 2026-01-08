@@ -101,6 +101,26 @@ pub enum TunnelMessage {
     /// 心跳
     Ping,
     Pong,
+    /// HTTP 代理请求 (Server -> Client)
+    HttpRequest {
+        request_id: String,
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    },
+    /// HTTP 代理响应 (Client -> Server)
+    HttpResponse {
+        request_id: String,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    },
+    /// HTTP 代理错误 (Client -> Server)
+    HttpError {
+        request_id: String,
+        error: String,
+    },
 }
 
 /// 隧道连接信息 (用于 API 响应)

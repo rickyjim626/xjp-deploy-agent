@@ -3,20 +3,24 @@
 //! 包含 /tunnel/* 端点
 
 use axum::{
+    body::Body,
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
-        State,
+        Path, State,
     },
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::get,
+    http::{HeaderMap, Method, Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, get},
     Json, Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
+use tracing::{debug, error, warn};
 
 use crate::domain::tunnel::{
-    ConnectedClientInfo, PortMappingStatus, TunnelClientStatus, TunnelMode, TunnelServerStatus,
-    TunnelStatusResponse,
+    ConnectedClientInfo, PortMappingStatus, TunnelClientStatus, TunnelMessage, TunnelMode,
+    TunnelServerStatus, TunnelStatusResponse,
 };
 use crate::middleware::RequireApiKey;
 use crate::state::AppState;
@@ -26,6 +30,9 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/tunnel/status", get(get_tunnel_status))
         .route("/tunnel/ws", get(tunnel_websocket_handler))
+        .route("/tunnel/proxy/{client_id}", any(tunnel_proxy_handler))
+        .route("/tunnel/proxy/{client_id}/", any(tunnel_proxy_handler))
+        .route("/tunnel/proxy/{client_id}/*path", any(tunnel_proxy_handler))
 }
 
 /// 获取隧道状态
@@ -174,4 +181,140 @@ async fn handle_tunnel_server_connection(
     client_addr: String,
 ) {
     crate::services::tunnel::server::handle_connection(socket, state, client_addr).await;
+}
+
+/// HTTP 代理处理器
+///
+/// ANY /tunnel/proxy/{client_id}/*
+/// 将 HTTP 请求通过隧道转发到指定客户端
+async fn tunnel_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    Path(params): Path<ProxyParams>,
+    method: Method,
+    headers: HeaderMap,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    // 检查是否为 Server 模式
+    if state.tunnel_mode != TunnelMode::Server {
+        return (StatusCode::BAD_REQUEST, "Tunnel server mode not enabled").into_response();
+    }
+
+    let client_id = &params.client_id;
+    let path = params.path.as_deref().unwrap_or("");
+    let full_path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path)
+    };
+
+    debug!(client_id = %client_id, path = %full_path, method = %method, "Proxy request");
+
+    // 查找客户端
+    let server_state = &state.tunnel_server_state;
+    let clients_guard = server_state.clients.read().await;
+
+    let client = match clients_guard.get(client_id) {
+        Some(c) => c,
+        None => {
+            warn!(client_id = %client_id, "Client not found for proxy request");
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "client_not_found",
+                    "message": format!("Client '{}' is not connected", client_id)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // 生成请求 ID
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // 收集 headers
+    let header_vec: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| {
+            // 过滤掉 hop-by-hop headers
+            let name_str = name.as_str().to_lowercase();
+            !matches!(
+                name_str.as_str(),
+                "host" | "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+            )
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect();
+
+    // 读取 body
+    let body_bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                None
+            } else {
+                Some(bytes.to_vec())
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to read request body");
+            return (StatusCode::BAD_REQUEST, "Failed to read request body").into_response();
+        }
+    };
+
+    // 创建响应通道
+    let (tx, rx) = oneshot::channel();
+
+    // 注册等待响应
+    {
+        let mut pending = server_state.pending_http_requests.write().await;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    // 发送 HTTP 请求消息到客户端
+    let http_request = TunnelMessage::HttpRequest {
+        request_id: request_id.clone(),
+        method: method.to_string(),
+        path: full_path.clone(),
+        headers: header_vec,
+        body: body_bytes,
+    };
+
+    if let Err(e) = client.ws_tx.send(http_request).await {
+        error!(error = %e, "Failed to send HTTP request to client");
+        // 清理
+        let mut pending = server_state.pending_http_requests.write().await;
+        pending.remove(&request_id);
+        return (StatusCode::BAD_GATEWAY, "Failed to send request to client").into_response();
+    }
+
+    drop(clients_guard); // 释放锁
+
+    // 等待响应 (超时 30 秒)
+    let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
+
+    match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            error!(request_id = %request_id, "Response channel closed");
+            (StatusCode::BAD_GATEWAY, "Response channel closed").into_response()
+        }
+        Err(_) => {
+            // 超时，清理
+            let mut pending = server_state.pending_http_requests.write().await;
+            pending.remove(&request_id);
+            error!(request_id = %request_id, "Proxy request timeout");
+            (StatusCode::GATEWAY_TIMEOUT, "Request timeout").into_response()
+        }
+    }
+}
+
+/// 代理路径参数
+#[derive(serde::Deserialize)]
+struct ProxyParams {
+    client_id: String,
+    path: Option<String>,
 }

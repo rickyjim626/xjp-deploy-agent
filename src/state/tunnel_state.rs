@@ -2,9 +2,10 @@
 //!
 //! 包含 tokio 同步原语的运行时状态，与 domain/tunnel.rs 的纯数据类型分离
 
+use axum::response::Response;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::tunnel::{PortMapping, TunnelMessage};
@@ -52,6 +53,8 @@ pub struct TunnelServerState {
     /// 端口到客户端的映射 (remote_port -> client_id)
     /// 用于快速查找某个端口属于哪个客户端
     pub port_to_client: RwLock<HashMap<u16, String>>,
+    /// 等待 HTTP 代理响应的通道 (request_id -> response sender)
+    pub pending_http_requests: RwLock<HashMap<String, oneshot::Sender<Response>>>,
 }
 
 impl TunnelServerState {
@@ -59,6 +62,7 @@ impl TunnelServerState {
         Self {
             clients: RwLock::new(HashMap::new()),
             port_to_client: RwLock::new(HashMap::new()),
+            pending_http_requests: RwLock::new(HashMap::new()),
         }
     }
 
