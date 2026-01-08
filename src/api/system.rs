@@ -4,12 +4,15 @@
 
 use axum::{
     extract::State,
-    response::IntoResponse,
+    response::{IntoResponse, sse::{Event, Sse}},
     routing::{get, post},
     Json, Router,
 };
+use futures::stream::Stream;
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use std::convert::Infallible;
 use std::sync::Arc;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
@@ -28,6 +31,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/update", post(force_update))
         .route("/service-logs", get(get_service_logs))
         .route("/logs/agent", get(get_agent_logs))  // 无需认证的 Agent 日志端点
+        .route("/logs/agent/stream", get(stream_agent_logs))  // SSE 实时日志流
         .route("/config", get(get_config))
 }
 
@@ -521,4 +525,109 @@ async fn get_agent_logs(
             })))
         }
     }
+}
+
+/// SSE 流式日志查询参数
+#[derive(Debug, Deserialize)]
+pub struct StreamLogsQuery {
+    /// 初始返回行数，默认 50
+    #[serde(default = "default_initial_lines")]
+    pub initial: u32,
+}
+
+fn default_initial_lines() -> u32 {
+    50
+}
+
+/// 流式获取 Agent 运行日志（SSE）
+///
+/// GET /logs/agent/stream
+/// 无需 API Key
+///
+/// 通过 journalctl -f 实时流式传输 xjp-deploy-agent 服务日志
+async fn stream_agent_logs(
+    axum::extract::Query(query): axum::extract::Query<StreamLogsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let initial_lines = query.initial.min(100);
+
+    tracing::info!(initial_lines = initial_lines, "Starting SSE log stream");
+
+    let stream = async_stream::stream! {
+        // 先获取历史日志
+        let mut cmd = Command::new("journalctl");
+        cmd.args([
+            "-u", "xjp-deploy-agent",
+            "-n", &initial_lines.to_string(),
+            "--no-pager",
+            "-o", "short-iso",
+        ]);
+
+        if let Ok(output) = cmd.output().await {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                yield Ok(Event::default().data(line));
+            }
+        }
+
+        // 发送分隔符表示历史日志结束
+        yield Ok(Event::default().event("history_end").data("---"));
+
+        // 使用 journalctl -f 实时追踪日志
+        let mut follow_cmd = Command::new("journalctl");
+        follow_cmd.args([
+            "-u", "xjp-deploy-agent",
+            "-f",
+            "--no-pager",
+            "-o", "short-iso",
+        ]);
+        follow_cmd.stdout(std::process::Stdio::piped());
+        follow_cmd.stderr(std::process::Stdio::null());
+
+        match follow_cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(stdout) = child.stdout.take() {
+                    let reader = BufReader::new(stdout);
+                    let mut lines = reader.lines();
+
+                    // 持续读取日志行
+                    loop {
+                        tokio::select! {
+                            result = lines.next_line() => {
+                                match result {
+                                    Ok(Some(line)) => {
+                                        yield Ok(Event::default().data(line));
+                                    }
+                                    Ok(None) => {
+                                        // journalctl 进程结束
+                                        tracing::info!("journalctl process ended");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Error reading journalctl output");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 确保子进程被正确清理
+                let _ = child.kill().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to spawn journalctl");
+                yield Ok(Event::default().event("error").data(format!("Failed to start log stream: {}", e)));
+            }
+        }
+
+        // 发送结束事件
+        yield Ok(Event::default().event("end").data("Stream ended"));
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping")
+    )
 }
