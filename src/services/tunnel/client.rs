@@ -290,10 +290,17 @@ async fn handle_server_message(
         } => {
             debug!(request_id = %request_id, method = %method, path = %path, "Received HTTP proxy request");
 
+            // 查找 deploy-agent 映射的本地端口，默认 9876
+            let local_port = mappings
+                .iter()
+                .find(|m| m.name == "deploy-agent")
+                .map(|m| m.local_port)
+                .unwrap_or(9876);
+
             let ws_tx_clone = ws_tx.clone();
             tokio::spawn(async move {
-                // 默认代理到本地 deploy-agent API (localhost:9876)
-                let local_url = format!("http://127.0.0.1:9876{}", path);
+                // 代理到本地 deploy-agent API
+                let local_url = format!("http://127.0.0.1:{}{}", local_port, path);
 
                 let client = reqwest::Client::new();
                 let method = match method.as_str() {
