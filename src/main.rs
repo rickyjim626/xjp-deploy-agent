@@ -74,8 +74,10 @@ async fn main() {
         tokio::spawn(async move {
             frp_clone.supervise().await;
         });
-    } else if state.tunnel_mode == TunnelMode::Client {
-        // WebSocket 隧道客户端
+    }
+
+    // 3.2.1 WebSocket 隧道客户端
+    if state.tunnel_mode == TunnelMode::Client {
         let state_clone = state.clone();
         tokio::spawn(async move {
             services::tunnel::client::start(state_clone).await;

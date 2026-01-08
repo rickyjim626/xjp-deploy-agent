@@ -226,18 +226,79 @@ async fn handle_server_message(
                             Ok(stream) => {
                                 info!(conn_id = %conn_id_clone, local_addr = %local_addr, "Connected to local service");
 
-                                // 发送连接成功
+                                // 先注册连接，再发送 Connected
+                                // 这样可以避免服务端发送数据时客户端还没注册连接的竞态条件
+                                let (mut read_half, mut write_half) = stream.into_split();
+                                let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
+
+                                // 先注册连接
+                                {
+                                    let mut conns = local_connections_clone.write().await;
+                                    conns.insert(conn_id_clone.clone(), data_tx);
+                                }
+
+                                // 再发送连接成功
                                 let _ = ws_tx_clone.send(TunnelMessage::Connected {
                                     conn_id: conn_id_clone.clone(),
                                 }).await;
 
                                 // 启动数据转发
-                                handle_local_connection(
-                                    conn_id_clone,
-                                    stream,
-                                    ws_tx_clone,
-                                    local_connections_clone,
-                                ).await;
+                                let conn_id_read = conn_id_clone.clone();
+                                let conn_id_write = conn_id_clone.clone();
+                                let ws_tx_read = ws_tx_clone.clone();
+                                let local_connections_read = local_connections_clone.clone();
+
+                                // 读取任务：从本地服务读取数据，发送到 WebSocket
+                                let read_task = tokio::spawn(async move {
+                                    let mut buf = vec![0u8; READ_BUFFER_SIZE];
+                                    loop {
+                                        match read_half.read(&mut buf).await {
+                                            Ok(0) => {
+                                                debug!(conn_id = %conn_id_read, "Local connection closed");
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                let data = buf[..n].to_vec();
+                                                if let Err(e) = ws_tx_read.send(TunnelMessage::Data {
+                                                    conn_id: conn_id_read.clone(),
+                                                    data,
+                                                }).await {
+                                                    error!(error = %e, "Failed to send data to WebSocket");
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!(conn_id = %conn_id_read, error = %e, "Error reading from local connection");
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    // 发送关闭消息
+                                    let _ = ws_tx_read.send(TunnelMessage::Close {
+                                        conn_id: conn_id_read.clone(),
+                                    }).await;
+
+                                    // 移除连接
+                                    let mut conns = local_connections_read.write().await;
+                                    conns.remove(&conn_id_read);
+                                });
+
+                                // 写入任务：从通道接收数据，写入本地服务
+                                let write_task = tokio::spawn(async move {
+                                    while let Some(data) = data_rx.recv().await {
+                                        if let Err(e) = write_half.write_all(&data).await {
+                                            error!(conn_id = %conn_id_write, error = %e, "Error writing to local connection");
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                // 等待任一任务完成
+                                tokio::select! {
+                                    _ = read_task => {}
+                                    _ = write_task => {}
+                                }
                             }
                             Err(e) => {
                                 error!(conn_id = %conn_id_clone, error = %e, "Failed to connect to local service");
@@ -389,78 +450,3 @@ async fn handle_server_message(
     }
 }
 
-/// 处理本地连接的数据转发
-async fn handle_local_connection(
-    conn_id: String,
-    stream: TcpStream,
-    ws_tx: mpsc::Sender<TunnelMessage>,
-    local_connections: Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
-) {
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    // 创建写入通道
-    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
-
-    // 注册连接
-    {
-        let mut conns = local_connections.write().await;
-        conns.insert(conn_id.clone(), data_tx);
-    }
-
-    let conn_id_read = conn_id.clone();
-    let conn_id_write = conn_id.clone();
-    let ws_tx_read = ws_tx.clone();
-    let local_connections_clone = local_connections.clone();
-
-    // 读取任务：从本地服务读取数据，发送到 WebSocket
-    let read_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; READ_BUFFER_SIZE];
-        loop {
-            match read_half.read(&mut buf).await {
-                Ok(0) => {
-                    debug!(conn_id = %conn_id_read, "Local connection closed");
-                    break;
-                }
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    if let Err(e) = ws_tx_read.send(TunnelMessage::Data {
-                        conn_id: conn_id_read.clone(),
-                        data,
-                    }).await {
-                        error!(error = %e, "Failed to send data to WebSocket");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!(conn_id = %conn_id_read, error = %e, "Error reading from local connection");
-                    break;
-                }
-            }
-        }
-
-        // 发送关闭消息
-        let _ = ws_tx_read.send(TunnelMessage::Close {
-            conn_id: conn_id_read.clone(),
-        }).await;
-
-        // 移除连接
-        let mut conns = local_connections_clone.write().await;
-        conns.remove(&conn_id_read);
-    });
-
-    // 写入任务：从通道接收数据，写入本地服务
-    let write_task = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            if let Err(e) = write_half.write_all(&data).await {
-                error!(conn_id = %conn_id_write, error = %e, "Error writing to local connection");
-                break;
-            }
-        }
-    });
-
-    // 等待任一任务完成
-    tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
-    }
-}

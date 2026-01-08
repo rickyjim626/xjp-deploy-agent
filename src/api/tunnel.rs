@@ -9,7 +9,7 @@ use axum::{
         Path, State,
     },
     http::{HeaderMap, Method, Request, StatusCode},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{any, get},
     Json, Router,
 };
