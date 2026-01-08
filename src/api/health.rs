@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::config::autoupdate::AutoUpdateStatus;
 use crate::config::env::constants::VERSION;
+use crate::domain::ssh::SshHealthInfo;
 use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::error::ApiResult;
 use crate::middleware::RequireApiKey;
@@ -64,6 +65,8 @@ struct HealthResponse {
     nfa: Option<NfaStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tunnel: Option<TunnelStatusSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh: Option<SshHealthInfo>,
 }
 
 /// 重启响应
@@ -123,6 +126,16 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         None
     };
 
+    // 获取 SSH 状态（如果启用）
+    let ssh_status = {
+        let ssh_guard = state.ssh_server.read().await;
+        if let Some(ssh) = ssh_guard.as_ref() {
+            Some(ssh.health_info().await)
+        } else {
+            None
+        }
+    };
+
     // 获取隧道状态
     let tunnel_status = match &state.tunnel_mode {
         TunnelMode::Server => {
@@ -178,6 +191,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         auto_update: auto_update_status,
         nfa: nfa_status,
         tunnel: tunnel_status,
+        ssh: ssh_status,
     })
 }
 

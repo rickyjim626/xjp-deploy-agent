@@ -52,11 +52,14 @@ async fn main() {
     if state.config.ssh.enabled {
         let ssh_config = state.config.ssh.clone();
         let api_key = state.config.api_key.clone();
+        let state_clone = state.clone();
         tokio::spawn(async move {
             match SshServer::new(ssh_config.clone(), api_key).await {
                 Ok(server) => {
                     tracing::info!(port = ssh_config.port, "SSH server starting");
                     let server = Arc::new(server);
+                    // 存储到 AppState 以便 health API 获取状态
+                    *state_clone.ssh_server.write().await = Some(server.clone());
                     if let Err(e) = server.run().await {
                         tracing::error!(error = %e, "SSH server error");
                     }

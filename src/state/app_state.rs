@@ -14,7 +14,7 @@ use crate::config::{
 };
 use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::infra::DeployCenterClient;
-use crate::services::{frp::FrpcManager, nfa::NfaSupervisor};
+use crate::services::{frp::FrpcManager, nfa::NfaSupervisor, ssh::SshServer};
 
 use super::log_hub::LogHub;
 use super::task_store::TaskStore;
@@ -76,11 +76,13 @@ pub struct AppState {
     /// 隧道服务端 URL (Client 模式)
     pub tunnel_server_url: String,
 
-    // ========== NFA / FRP ==========
+    // ========== NFA / FRP / SSH ==========
     /// NFA supervisor (Windows 节点，可选)
     pub nfa: Option<Arc<NfaSupervisor>>,
     /// FRP client manager (托管 frpc，可选)
     pub frp: Option<Arc<FrpcManager>>,
+    /// SSH 服务器 (可选，需要在 main 中异步初始化后设置)
+    pub ssh_server: RwLock<Option<Arc<SshServer>>>,
 
     // ========== 自动更新 ==========
     /// 自动更新配置
@@ -151,6 +153,7 @@ impl AppState {
 
             nfa,
             frp,
+            ssh_server: RwLock::new(None),
 
             auto_update_config: config.auto_update.clone(),
             auto_update_state: Arc::new(AutoUpdateState::new()),
