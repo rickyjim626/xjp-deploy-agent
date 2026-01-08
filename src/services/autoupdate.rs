@@ -369,14 +369,103 @@ async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::E
         return Err(format!("exec failed: {}", err).into());
     }
 
-    // 在非 Unix 系统上，生成新进程然后退出
-    #[cfg(not(unix))]
+    // 在 Windows 系统上，使用 PowerShell 脚本延迟重启
+    #[cfg(windows)]
     {
+        restart_self_windows(binary_path, &args).await?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Fallback for other platforms
         std::process::Command::new(binary_path)
             .args(&args[1..])
             .spawn()?;
         std::process::exit(0);
     }
+}
+
+/// Windows 专用重启函数
+///
+/// 由于 Windows 无法替换正在运行的 EXE，我们使用 PowerShell 脚本：
+/// 1. 当前进程退出
+/// 2. PowerShell 等待并复制新二进制
+/// 3. PowerShell 启动新版本
+#[cfg(windows)]
+async fn restart_self_windows(
+    binary_path: &PathBuf,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+
+    let binary_str = binary_path.to_string_lossy().replace('\\', "\\\\");
+    let args_str = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        String::new()
+    };
+
+    // 创建 PowerShell 重启脚本
+    let ps_script = format!(
+        r#"
+# XJP Deploy Agent 自动更新脚本
+$ErrorActionPreference = 'SilentlyContinue'
+
+# 等待旧进程退出
+Start-Sleep -Seconds 2
+
+# 尝试停止旧进程 (以防万一)
+Get-Process -Name 'xjp-deploy-agent' | Stop-Process -Force
+
+# 再等待一下确保文件释放
+Start-Sleep -Seconds 1
+
+# 启动新版本
+$binary = "{binary}"
+$args = "{args}"
+
+if ($args) {{
+    Start-Process -FilePath $binary -ArgumentList $args -WindowStyle Hidden
+}} else {{
+    Start-Process -FilePath $binary -WindowStyle Hidden
+}}
+
+# 清理脚本自身
+Start-Sleep -Seconds 1
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force
+"#,
+        binary = binary_str,
+        args = args_str
+    );
+
+    // 写入临时脚本文件
+    let script_path = std::env::temp_dir().join("xjp-deploy-agent-update.ps1");
+    let mut file = std::fs::File::create(&script_path)?;
+    file.write_all(ps_script.as_bytes())?;
+    drop(file);
+
+    tracing::info!(
+        script = %script_path.display(),
+        "Starting PowerShell update script"
+    );
+
+    // 启动 PowerShell 脚本 (隐藏窗口)
+    std::process::Command::new("powershell")
+        .args([
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_path.to_str().unwrap(),
+        ])
+        .spawn()?;
+
+    // 给脚本一点时间启动
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    tracing::info!("Exiting for update...");
+    std::process::exit(0);
 }
 
 /// 获取更新元数据
