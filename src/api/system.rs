@@ -27,6 +27,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/exec", post(exec_command))
         .route("/update", post(force_update))
         .route("/service-logs", get(get_service_logs))
+        .route("/logs/agent", get(get_agent_logs))  // 无需认证的 Agent 日志端点
         .route("/config", get(get_config))
 }
 
@@ -441,4 +442,83 @@ async fn get_config(
         "tunnel": tunnel,
         "api_key_configured": !state.api_key.is_empty(),
     }))
+}
+
+/// Agent 日志查询参数
+#[derive(Debug, Deserialize)]
+pub struct AgentLogsQuery {
+    /// 返回行数，默认 100，最大 200
+    #[serde(default = "default_agent_log_lines")]
+    pub lines: u32,
+}
+
+fn default_agent_log_lines() -> u32 {
+    100
+}
+
+/// 获取 Agent 运行日志（无需认证）
+///
+/// GET /logs/agent
+/// 无需 API Key
+///
+/// 返回最近的 xjp-deploy-agent 服务日志
+/// 限制最多 200 行，用于前端监控面板显示
+async fn get_agent_logs(
+    axum::extract::Query(query): axum::extract::Query<AgentLogsQuery>,
+) -> ApiResult<impl IntoResponse> {
+    // 限制最大行数为 200
+    let lines = query.lines.min(200);
+
+    tracing::debug!(lines = lines, "Fetching agent logs (public endpoint)");
+
+    let mut cmd = Command::new("journalctl");
+    cmd.args([
+        "-u", "xjp-deploy-agent",
+        "-n", &lines.to_string(),
+        "--no-pager",
+        "-o", "short-iso",  // 使用 ISO 时间格式便于阅读
+    ]);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cmd.output(),
+    ).await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if !output.status.success() {
+                // 可能是 journalctl 没有权限或服务不存在，返回空日志
+                return Ok(Json(serde_json::json!({
+                    "lines": 0,
+                    "logs": [],
+                    "error": if stderr.is_empty() { stdout } else { stderr },
+                })));
+            }
+
+            // 将日志按行分割
+            let log_lines: Vec<&str> = stdout.lines().collect();
+
+            Ok(Json(serde_json::json!({
+                "lines": log_lines.len(),
+                "logs": log_lines,
+            })))
+        }
+        Ok(Err(e)) => {
+            Ok(Json(serde_json::json!({
+                "lines": 0,
+                "logs": [],
+                "error": format!("Failed to execute journalctl: {}", e),
+            })))
+        }
+        Err(_) => {
+            Ok(Json(serde_json::json!({
+                "lines": 0,
+                "logs": [],
+                "error": "journalctl command timed out",
+            })))
+        }
+    }
 }
