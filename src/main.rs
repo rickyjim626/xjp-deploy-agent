@@ -124,7 +124,15 @@ async fn main() {
         });
     }
 
-    // 3.4 定期清理任务
+    // 3.4 日志上报服务 (上报 journalctl 日志到 Deploy Center，用于离线查看)
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            services::log_reporter::start(state_clone).await;
+        });
+    }
+
+    // 3.5 定期清理任务
     {
         let state_clone = state.clone();
         tokio::spawn(async move {

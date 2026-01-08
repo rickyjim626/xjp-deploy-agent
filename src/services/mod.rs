@@ -8,3 +8,4 @@ pub mod frp;
 pub mod nfa;
 pub mod ssh;
 pub mod tunnel;
+pub mod log_reporter;
