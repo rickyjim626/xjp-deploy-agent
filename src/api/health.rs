@@ -19,16 +19,31 @@ use crate::middleware::RequireApiKey;
 use crate::services::nfa::NfaStatus;
 use crate::state::AppState;
 
+/// 连接的客户端信息（用于 health 端点）
+#[derive(Debug, Serialize)]
+struct ConnectedClient {
+    client_id: String,
+    client_addr: String,
+    connected_at: String,
+    port_mappings: Vec<PortMapping>,
+}
+
 /// 隧道状态摘要（用于 health 端点）
 #[derive(Debug, Serialize)]
 struct TunnelStatusSummary {
     mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_url: Option<String>,
+    /// 已连接的客户端数量 (Server 模式)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_count: Option<usize>,
+    /// 已连接的客户端列表 (Server 模式)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    clients: Vec<ConnectedClient>,
+    /// 向后兼容：是否有客户端连接
     #[serde(skip_serializing_if = "Option::is_none")]
     client_connected: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    client_addr: Option<String>,
+    /// Client 模式下的端口映射
     #[serde(skip_serializing_if = "Vec::is_empty")]
     port_mappings: Vec<PortMapping>,
 }
@@ -112,15 +127,28 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let tunnel_status = match &state.tunnel_mode {
         TunnelMode::Server => {
             let server_state = &state.tunnel_server_state;
-            let client_connected = *server_state.client_connected.read().await;
-            let client_addr = server_state.client_addr.read().await.clone();
-            let client_mappings = server_state.client_mappings.read().await.clone();
+            let clients_guard = server_state.clients.read().await;
+
+            // 收集所有连接的客户端信息
+            let connected_clients: Vec<ConnectedClient> = clients_guard
+                .values()
+                .map(|client| ConnectedClient {
+                    client_id: client.client_id.clone(),
+                    client_addr: client.client_addr.clone(),
+                    connected_at: client.connected_at.to_rfc3339(),
+                    port_mappings: client.mappings.clone(),
+                })
+                .collect();
+
+            let client_count = connected_clients.len();
+
             Some(TunnelStatusSummary {
                 mode: "server".to_string(),
                 server_url: None,
-                client_connected: Some(client_connected),
-                client_addr: if client_connected { client_addr } else { None },
-                port_mappings: client_mappings,
+                client_count: Some(client_count),
+                clients: connected_clients,
+                client_connected: Some(client_count > 0), // 向后兼容
+                port_mappings: Vec::new(),
             })
         }
         TunnelMode::Client => {
@@ -129,8 +157,9 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             Some(TunnelStatusSummary {
                 mode: "client".to_string(),
                 server_url: Some(state.tunnel_server_url.clone()),
+                client_count: None,
+                clients: Vec::new(),
                 client_connected: Some(connected),
-                client_addr: None,
                 port_mappings: state.tunnel_port_mappings.clone(),
             })
         }

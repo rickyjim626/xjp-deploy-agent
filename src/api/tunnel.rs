@@ -15,7 +15,8 @@ use axum::{
 use std::sync::Arc;
 
 use crate::domain::tunnel::{
-    PortMappingStatus, TunnelClientStatus, TunnelMode, TunnelServerStatus, TunnelStatusResponse,
+    ConnectedClientInfo, PortMappingStatus, TunnelClientStatus, TunnelMode, TunnelServerStatus,
+    TunnelStatusResponse,
 };
 use crate::middleware::RequireApiKey;
 use crate::state::AppState;
@@ -53,32 +54,43 @@ async fn get_tunnel_status(
     let response = match &state.tunnel_mode {
         TunnelMode::Server => {
             let server_state = &state.tunnel_server_state;
-            let client_connected = *server_state.client_connected.read().await;
-            let client_addr = server_state.client_addr.read().await.clone();
-            let client_connected_at = *server_state.client_connected_at.read().await;
-            let client_mappings = server_state.client_mappings.read().await.clone();
-            let port_listeners = server_state.port_listeners.read().await;
+            let clients_guard = server_state.clients.read().await;
 
-            let port_mappings: Vec<PortMappingStatus> = client_mappings
-                .iter()
-                .map(|m| PortMappingStatus {
-                    mapping: m.clone(),
-                    status: if port_listeners.contains_key(&m.remote_port) {
-                        "listening".to_string()
-                    } else {
-                        "pending".to_string()
-                    },
-                    active_connections: 0,
+            // 收集所有连接的客户端信息
+            let connected_clients: Vec<ConnectedClientInfo> = clients_guard
+                .values()
+                .map(|client| {
+                    let port_mappings: Vec<PortMappingStatus> = client
+                        .mappings
+                        .iter()
+                        .map(|m| PortMappingStatus {
+                            mapping: m.clone(),
+                            status: if client.port_listeners.contains_key(&m.remote_port) {
+                                "listening".to_string()
+                            } else {
+                                "pending".to_string()
+                            },
+                            active_connections: 0,
+                        })
+                        .collect();
+
+                    ConnectedClientInfo {
+                        client_id: client.client_id.clone(),
+                        client_addr: client.client_addr.clone(),
+                        connected_at: client.connected_at,
+                        port_mappings,
+                    }
                 })
                 .collect();
+
+            let client_count = connected_clients.len();
 
             TunnelStatusResponse::Server(TunnelServerStatus {
                 listening: true,
                 listen_port: state.config.port,
-                client_connected,
-                client_addr,
-                client_connected_at,
-                port_mappings,
+                client_count,
+                clients: connected_clients,
+                client_connected: client_count > 0, // 向后兼容
             })
         }
         TunnelMode::Client => {

@@ -30,6 +30,8 @@ pub struct EnvConfig {
 pub struct TunnelConfig {
     /// 隧道模式
     pub mode: TunnelMode,
+    /// 客户端 ID (Client 模式，用于标识不同客户端)
+    pub client_id: String,
     /// 认证令牌
     pub auth_token: String,
     /// 服务端 URL (Client 模式)
@@ -209,6 +211,13 @@ impl TunnelConfig {
             .map(|v| TunnelMode::from_str(&v))
             .unwrap_or(TunnelMode::Disabled);
 
+        // 客户端 ID，默认使用主机名
+        let client_id = env::var("TUNNEL_CLIENT_ID").unwrap_or_else(|_| {
+            hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        });
+
         let auth_token = env::var("TUNNEL_AUTH_TOKEN")
             .unwrap_or_else(|_| "change-tunnel-token".to_string());
 
@@ -221,6 +230,7 @@ impl TunnelConfig {
 
         Self {
             mode,
+            client_id,
             auth_token,
             server_url,
             port_mappings,

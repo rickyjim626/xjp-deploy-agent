@@ -9,35 +9,106 @@ use tokio_util::sync::CancellationToken;
 
 use crate::domain::tunnel::{PortMapping, TunnelMessage};
 
-/// 隧道状态 (Server 模式)
-pub struct TunnelServerState {
-    /// 客户端 WebSocket 连接是否活跃
-    pub client_connected: RwLock<bool>,
+/// 单个客户端的状态 (Server 视角)
+pub struct ClientState {
+    /// 客户端 ID
+    pub client_id: String,
     /// 客户端地址
-    pub client_addr: RwLock<Option<String>>,
-    /// 客户端连接时间
-    pub client_connected_at: RwLock<Option<DateTime<Utc>>>,
+    pub client_addr: String,
+    /// 连接时间
+    pub connected_at: DateTime<Utc>,
     /// 客户端的端口映射配置
-    pub client_mappings: RwLock<Vec<PortMapping>>,
-    /// 活跃的代理连接 (conn_id -> 发送通道)
-    pub proxy_connections: RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    pub mappings: Vec<PortMapping>,
     /// 发送消息到 WebSocket 客户端的通道
-    pub ws_tx: RwLock<Option<mpsc::Sender<TunnelMessage>>>,
+    pub ws_tx: mpsc::Sender<TunnelMessage>,
+    /// 活跃的代理连接 (conn_id -> 发送通道)
+    pub proxy_connections: HashMap<String, mpsc::Sender<Vec<u8>>>,
     /// 端口监听器取消令牌 (port -> cancel_token)
-    pub port_listeners: RwLock<HashMap<u16, CancellationToken>>,
+    pub port_listeners: HashMap<u16, CancellationToken>,
+}
+
+impl ClientState {
+    pub fn new(
+        client_id: String,
+        client_addr: String,
+        ws_tx: mpsc::Sender<TunnelMessage>,
+    ) -> Self {
+        Self {
+            client_id,
+            client_addr,
+            connected_at: Utc::now(),
+            mappings: Vec::new(),
+            ws_tx,
+            proxy_connections: HashMap::new(),
+            port_listeners: HashMap::new(),
+        }
+    }
+}
+
+/// 隧道状态 (Server 模式) - 支持多客户端
+pub struct TunnelServerState {
+    /// 已连接的客户端 (client_id -> ClientState)
+    pub clients: RwLock<HashMap<String, ClientState>>,
+    /// 端口到客户端的映射 (remote_port -> client_id)
+    /// 用于快速查找某个端口属于哪个客户端
+    pub port_to_client: RwLock<HashMap<u16, String>>,
 }
 
 impl TunnelServerState {
     pub fn new() -> Self {
         Self {
-            client_connected: RwLock::new(false),
-            client_addr: RwLock::new(None),
-            client_connected_at: RwLock::new(None),
-            client_mappings: RwLock::new(Vec::new()),
-            proxy_connections: RwLock::new(HashMap::new()),
-            ws_tx: RwLock::new(None),
-            port_listeners: RwLock::new(HashMap::new()),
+            clients: RwLock::new(HashMap::new()),
+            port_to_client: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// 添加客户端
+    pub async fn add_client(&self, client_state: ClientState) {
+        let client_id = client_state.client_id.clone();
+        let mut clients = self.clients.write().await;
+        clients.insert(client_id, client_state);
+    }
+
+    /// 移除客户端并清理资源
+    pub async fn remove_client(&self, client_id: &str) -> Option<ClientState> {
+        let mut clients = self.clients.write().await;
+        if let Some(mut client) = clients.remove(client_id) {
+            // 取消所有端口监听器
+            for (port, cancel_token) in client.port_listeners.drain() {
+                tracing::info!(client_id = %client_id, port = port, "Stopping port listener");
+                cancel_token.cancel();
+            }
+
+            // 从端口映射中移除
+            let mut port_to_client = self.port_to_client.write().await;
+            port_to_client.retain(|_, cid| cid != client_id);
+
+            Some(client)
+        } else {
+            None
+        }
+    }
+
+    /// 获取客户端数量
+    pub async fn client_count(&self) -> usize {
+        self.clients.read().await.len()
+    }
+
+    /// 检查客户端是否存在
+    pub async fn has_client(&self, client_id: &str) -> bool {
+        self.clients.read().await.contains_key(client_id)
+    }
+
+    /// 注册端口到客户端的映射
+    pub async fn register_port(&self, port: u16, client_id: String) {
+        let mut port_to_client = self.port_to_client.write().await;
+        port_to_client.insert(port, client_id);
+    }
+
+    /// 根据端口查找客户端 ID
+    pub async fn get_client_by_port(&self, port: u16) -> Option<String> {
+        let port_to_client = self.port_to_client.read().await;
+        port_to_client.get(&port).cloned()
     }
 }
 

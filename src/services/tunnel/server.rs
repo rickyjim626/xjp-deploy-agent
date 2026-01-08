@@ -1,13 +1,12 @@
 //! 隧道服务端
 //!
-//! 接收客户端连接，监听远程端口，转发数据到客户端
+//! 接收多个客户端连接，监听远程端口，转发数据到对应客户端
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,43 +16,19 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::domain::tunnel::{PortMapping, TunnelMessage};
+use crate::state::tunnel_state::ClientState;
 use crate::state::AppState;
 
 const READ_BUFFER_SIZE: usize = 65536;
 const PING_INTERVAL_SECS: u64 = 30;
 
 /// 处理隧道服务端连接
-pub async fn handle_connection(
-    socket: WebSocket,
-    state: Arc<AppState>,
-    client_addr: String,
-) {
-    info!(client_addr = %client_addr, "Tunnel client connected");
+pub async fn handle_connection(socket: WebSocket, state: Arc<AppState>, client_addr: String) {
+    info!(client_addr = %client_addr, "New tunnel client connection");
 
-    let server_state = &state.tunnel_server_state;
-
-    // 更新状态
-    *server_state.client_connected.write().await = true;
-    *server_state.client_addr.write().await = Some(client_addr.clone());
-    *server_state.client_connected_at.write().await = Some(Utc::now());
-
-    if let Err(e) = run_server(socket, state.clone()).await {
-        error!(error = %e, "Tunnel server error");
+    if let Err(e) = run_server(socket, state.clone(), client_addr.clone()).await {
+        error!(error = %e, client_addr = %client_addr, "Tunnel server error");
     }
-
-    // 清理状态
-    *server_state.client_connected.write().await = false;
-    *server_state.client_addr.write().await = None;
-
-    // 停止所有端口监听
-    let mut listeners = server_state.port_listeners.write().await;
-    for (port, cancel_token) in listeners.drain() {
-        info!(port = port, "Stopping port listener");
-        cancel_token.cancel();
-    }
-
-    // 清理映射
-    server_state.client_mappings.write().await.clear();
 
     info!(client_addr = %client_addr, "Tunnel client disconnected");
 }
@@ -62,19 +37,22 @@ pub async fn handle_connection(
 async fn run_server(
     socket: WebSocket,
     state: Arc<AppState>,
+    client_addr: String,
 ) -> anyhow::Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let _server_state = &state.tunnel_server_state;
+    let server_state = &state.tunnel_server_state;
 
     // 用于接收要发送的消息
     let (msg_tx, mut msg_rx) = mpsc::channel::<TunnelMessage>(256);
+
+    // 客户端 ID，等待 Config 消息获取
+    let mut client_id: Option<String> = None;
 
     // 远程连接管理 (conn_id -> 发送数据到 TCP 的通道)
     let remote_connections: Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     // 等待连接确认的 pending connections (conn_id -> oneshot sender)
-    // 当客户端发送 Connected 时，通过这个 channel 通知服务端可以开始读取数据
     let pending_connections: Arc<tokio::sync::RwLock<HashMap<String, oneshot::Sender<()>>>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -89,13 +67,56 @@ async fn run_server(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<TunnelMessage>(&text) {
                             Ok(tunnel_msg) => {
-                                handle_client_message(
-                                    tunnel_msg,
-                                    state.clone(),
-                                    msg_tx.clone(),
-                                    remote_connections.clone(),
-                                    pending_connections.clone(),
-                                ).await;
+                                // 处理 Config 消息时初始化客户端
+                                if let TunnelMessage::Config { client_id: cid, mappings } = &tunnel_msg {
+                                    if client_id.is_none() {
+                                        // 检查是否已有同 ID 的客户端连接
+                                        if server_state.has_client(cid).await {
+                                            warn!(client_id = %cid, "Client with same ID already connected, disconnecting old one");
+                                            server_state.remove_client(cid).await;
+                                        }
+
+                                        // 创建新的客户端状态
+                                        let mut new_client = ClientState::new(
+                                            cid.clone(),
+                                            client_addr.clone(),
+                                            msg_tx.clone(),
+                                        );
+                                        new_client.mappings = mappings.clone();
+
+                                        // 添加到服务器状态
+                                        server_state.add_client(new_client).await;
+                                        client_id = Some(cid.clone());
+
+                                        info!(
+                                            client_id = %cid,
+                                            client_addr = %client_addr,
+                                            mappings = mappings.len(),
+                                            "Client registered"
+                                        );
+
+                                        // 为每个映射启动端口监听器
+                                        for mapping in mappings {
+                                            start_port_listener(
+                                                mapping.clone(),
+                                                cid.clone(),
+                                                state.clone(),
+                                                msg_tx.clone(),
+                                                remote_connections.clone(),
+                                                pending_connections.clone(),
+                                            ).await;
+                                        }
+                                    }
+                                } else if let Some(cid) = &client_id {
+                                    handle_client_message(
+                                        tunnel_msg,
+                                        cid.clone(),
+                                        state.clone(),
+                                        msg_tx.clone(),
+                                        remote_connections.clone(),
+                                        pending_connections.clone(),
+                                    ).await;
+                                }
                             }
                             Err(e) => {
                                 warn!(error = %e, "Failed to parse tunnel message");
@@ -104,13 +125,16 @@ async fn run_server(
                     }
                     Some(Ok(Message::Binary(data))) => {
                         if let Ok(tunnel_msg) = serde_json::from_slice::<TunnelMessage>(&data) {
-                            handle_client_message(
-                                tunnel_msg,
-                                state.clone(),
-                                msg_tx.clone(),
-                                remote_connections.clone(),
-                                pending_connections.clone(),
-                            ).await;
+                            if let Some(cid) = &client_id {
+                                handle_client_message(
+                                    tunnel_msg,
+                                    cid.clone(),
+                                    state.clone(),
+                                    msg_tx.clone(),
+                                    remote_connections.clone(),
+                                    pending_connections.clone(),
+                                ).await;
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -154,6 +178,12 @@ async fn run_server(
         }
     }
 
+    // 清理客户端
+    if let Some(cid) = client_id {
+        info!(client_id = %cid, "Cleaning up client");
+        server_state.remove_client(&cid).await;
+    }
+
     // 清理所有远程连接
     let mut conns = remote_connections.write().await;
     conns.clear();
@@ -164,35 +194,21 @@ async fn run_server(
 /// 处理来自客户端的消息
 async fn handle_client_message(
     msg: TunnelMessage,
+    client_id: String,
     state: Arc<AppState>,
     msg_tx: mpsc::Sender<TunnelMessage>,
     remote_connections: Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
     pending_connections: Arc<tokio::sync::RwLock<HashMap<String, oneshot::Sender<()>>>>,
 ) {
-    let server_state = &state.tunnel_server_state;
+    let _server_state = &state.tunnel_server_state;
 
     match msg {
-        TunnelMessage::Config { mappings } => {
-            info!(mappings = mappings.len(), "Received client configuration");
-
-            // 保存映射配置
-            *server_state.client_mappings.write().await = mappings.clone();
-
-            // 为每个映射启动 TCP 监听器
-            for mapping in mappings {
-                start_port_listener(
-                    mapping,
-                    state.clone(),
-                    msg_tx.clone(),
-                    remote_connections.clone(),
-                    pending_connections.clone(),
-                ).await;
-            }
+        TunnelMessage::Config { .. } => {
+            // 已在上层处理
         }
 
         TunnelMessage::Connected { conn_id } => {
-            debug!(conn_id = %conn_id, "Client connected to local service");
-            // 通知 handle_remote_connection 可以开始读取数据了
+            debug!(client_id = %client_id, conn_id = %conn_id, "Client connected to local service");
             let mut pending = pending_connections.write().await;
             if let Some(tx) = pending.remove(&conn_id) {
                 let _ = tx.send(());
@@ -203,19 +219,16 @@ async fn handle_client_message(
         }
 
         TunnelMessage::ConnectFailed { conn_id, error } => {
-            warn!(conn_id = %conn_id, error = %error, "Client failed to connect to local service");
-            // 清理 pending 连接
+            warn!(client_id = %client_id, conn_id = %conn_id, error = %error, "Client failed to connect to local service");
             {
                 let mut pending = pending_connections.write().await;
                 pending.remove(&conn_id);
             }
-            // 清理远程连接
             let mut conns = remote_connections.write().await;
             conns.remove(&conn_id);
         }
 
         TunnelMessage::Data { conn_id, data } => {
-            // 转发数据到远程连接
             let conns = remote_connections.read().await;
             if let Some(tx) = conns.get(&conn_id) {
                 if let Err(e) = tx.send(data).await {
@@ -238,7 +251,6 @@ async fn handle_client_message(
             debug!("Received pong from client");
         }
 
-        // Server 不应该收到这些消息
         TunnelMessage::Connect { .. } => {
             warn!("Unexpected Connect message from client");
         }
@@ -248,6 +260,7 @@ async fn handle_client_message(
 /// 启动端口监听器
 async fn start_port_listener(
     mapping: PortMapping,
+    client_id: String,
     state: Arc<AppState>,
     msg_tx: mpsc::Sender<TunnelMessage>,
     remote_connections: Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
@@ -258,18 +271,32 @@ async fn start_port_listener(
 
     let cancel_token = CancellationToken::new();
 
-    // 记录监听器
+    // 注册端口到客户端的映射
+    state
+        .tunnel_server_state
+        .register_port(port, client_id.clone())
+        .await;
+
+    // 记录监听器到客户端状态
     {
-        let mut listeners = state.tunnel_server_state.port_listeners.write().await;
-        listeners.insert(port, cancel_token.clone());
+        let mut clients = state.tunnel_server_state.clients.write().await;
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.port_listeners.insert(port, cancel_token.clone());
+        }
     }
 
     let cancel_token_clone = cancel_token.clone();
+    let client_id_clone = client_id.clone();
 
     tokio::spawn(async move {
         match TcpListener::bind(&addr).await {
             Ok(listener) => {
-                info!(port = port, name = %mapping.name, "Started port listener");
+                info!(
+                    client_id = %client_id_clone,
+                    port = port,
+                    name = %mapping.name,
+                    "Started port listener"
+                );
 
                 loop {
                     tokio::select! {
@@ -284,21 +311,19 @@ async fn start_port_listener(
                                     let conn_id = Uuid::new_v4().to_string();
                                     info!(
                                         conn_id = %conn_id,
+                                        client_id = %client_id_clone,
                                         port = port,
                                         peer = %peer_addr,
                                         "New connection on tunnel port"
                                     );
 
-                                    // 创建 oneshot channel 来等待客户端连接确认
                                     let (ready_tx, ready_rx) = oneshot::channel();
 
-                                    // 注册 pending connection
                                     {
                                         let mut pending = pending_connections.write().await;
                                         pending.insert(conn_id.clone(), ready_tx);
                                     }
 
-                                    // 发送连接请求到客户端
                                     let msg_tx_clone = msg_tx.clone();
                                     let remote_connections_clone = remote_connections.clone();
                                     let pending_connections_clone = pending_connections.clone();
@@ -308,13 +333,11 @@ async fn start_port_listener(
                                         remote_port: port,
                                     }).await {
                                         error!(error = %e, "Failed to send connect request");
-                                        // 清理 pending connection
                                         let mut pending = pending_connections.write().await;
                                         pending.remove(&conn_id);
                                         continue;
                                     }
 
-                                    // 启动连接处理（会等待 ready_rx 信号后才开始读取数据）
                                     tokio::spawn(handle_remote_connection(
                                         conn_id,
                                         stream,
@@ -333,7 +356,12 @@ async fn start_port_listener(
                 }
             }
             Err(e) => {
-                error!(port = port, error = %e, "Failed to bind port listener");
+                error!(
+                    client_id = %client_id_clone,
+                    port = port,
+                    error = %e,
+                    "Failed to bind port listener"
+                );
             }
         }
     });
@@ -350,10 +378,8 @@ async fn handle_remote_connection(
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // 创建写入通道
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
 
-    // 注册连接（用于接收从客户端返回的数据）
     {
         let mut conns = remote_connections.write().await;
         conns.insert(conn_id.clone(), data_tx);
@@ -366,15 +392,13 @@ async fn handle_remote_connection(
     let remote_connections_clone = remote_connections.clone();
     let pending_connections_clone = pending_connections.clone();
 
-    // 读取任务：等待客户端连接确认后，从 TCP 连接读取数据，发送到 WebSocket
+    // 读取任务
     let read_task = tokio::spawn(async move {
-        // 等待客户端连接本地服务成功
         match ready_rx.await {
             Ok(()) => {
                 debug!(conn_id = %conn_id_read, "Received ready signal, starting to read TCP data");
             }
             Err(_) => {
-                // ready_tx 被 drop 了，说明连接失败或被取消
                 debug!(conn_id = %conn_id_read, "Ready signal channel closed, aborting read task");
                 return;
             }
@@ -389,10 +413,13 @@ async fn handle_remote_connection(
                 }
                 Ok(n) => {
                     let data = buf[..n].to_vec();
-                    if let Err(e) = msg_tx_read.send(TunnelMessage::Data {
-                        conn_id: conn_id_read.clone(),
-                        data,
-                    }).await {
+                    if let Err(e) = msg_tx_read
+                        .send(TunnelMessage::Data {
+                            conn_id: conn_id_read.clone(),
+                            data,
+                        })
+                        .await
+                    {
                         error!(error = %e, "Failed to send data");
                         break;
                     }
@@ -404,17 +431,17 @@ async fn handle_remote_connection(
             }
         }
 
-        // 发送关闭消息
-        let _ = msg_tx_read.send(TunnelMessage::Close {
-            conn_id: conn_id_read.clone(),
-        }).await;
+        let _ = msg_tx_read
+            .send(TunnelMessage::Close {
+                conn_id: conn_id_read.clone(),
+            })
+            .await;
 
-        // 移除连接
         let mut conns = remote_connections_clone.write().await;
         conns.remove(&conn_id_read);
     });
 
-    // 写入任务：从通道接收数据，写入 TCP 连接
+    // 写入任务
     let write_task = tokio::spawn(async move {
         while let Some(data) = data_rx.recv().await {
             if let Err(e) = write_half.write_all(&data).await {
@@ -424,13 +451,11 @@ async fn handle_remote_connection(
         }
     });
 
-    // 等待任一任务完成
     tokio::select! {
         _ = read_task => {}
         _ = write_task => {}
     }
 
-    // 清理 pending connection（如果还存在）
     {
         let mut pending = pending_connections_clone.write().await;
         pending.remove(&conn_id_cleanup);

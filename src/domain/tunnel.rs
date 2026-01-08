@@ -83,8 +83,11 @@ impl PortMapping {
 /// 隧道协议消息
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TunnelMessage {
-    /// 客户端发送端口映射配置
-    Config { mappings: Vec<PortMapping> },
+    /// 客户端发送端口映射配置 (包含客户端标识)
+    Config {
+        client_id: String,
+        mappings: Vec<PortMapping>,
+    },
     /// 新连接请求 (Server -> Client)
     Connect { conn_id: String, remote_port: u16 },
     /// 连接已建立 (Client -> Server)
@@ -130,15 +133,26 @@ pub struct TunnelClientStatus {
     pub mappings: Vec<PortMappingStatus>,
 }
 
+/// 单个客户端连接信息
+#[derive(Clone, Debug, Serialize)]
+pub struct ConnectedClientInfo {
+    pub client_id: String,
+    pub client_addr: String,
+    pub connected_at: DateTime<Utc>,
+    pub port_mappings: Vec<PortMappingStatus>,
+}
+
 /// 服务端状态
 #[derive(Clone, Debug, Serialize)]
 pub struct TunnelServerStatus {
     pub listening: bool,
     pub listen_port: u16,
+    /// 已连接的客户端数量
+    pub client_count: usize,
+    /// 已连接的客户端列表
+    pub clients: Vec<ConnectedClientInfo>,
+    /// 向后兼容：是否有客户端连接
     pub client_connected: bool,
-    pub client_addr: Option<String>,
-    pub client_connected_at: Option<DateTime<Utc>>,
-    pub port_mappings: Vec<PortMappingStatus>,
 }
 
 /// 隧道状态响应

@@ -63,6 +63,8 @@ pub struct AppState {
     // ========== 隧道相关 ==========
     /// 隧道模式
     pub tunnel_mode: TunnelMode,
+    /// 隧道客户端 ID (Client 模式，用于标识)
+    pub tunnel_client_id: String,
     /// 隧道认证令牌
     pub tunnel_auth_token: String,
     /// 隧道服务端状态 (仅 Server 模式)
@@ -140,6 +142,7 @@ impl AppState {
             deploy_center: DeployCenterClient::new(config.callback_url.clone()),
 
             tunnel_mode: config.tunnel.mode.clone(),
+            tunnel_client_id: config.tunnel.client_id.clone(),
             tunnel_auth_token: config.tunnel.auth_token.clone(),
             tunnel_server_state: Arc::new(TunnelServerState::new()),
             tunnel_client_state: Arc::new(TunnelClientState::new()),

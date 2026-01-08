@@ -1,6 +1,6 @@
 [package]
 name = "xjp-deploy-agent"
-version = "0.6.20"
+version = "0.6.21"
 edition = "2021"
 description = "Deploy agent for private cloud - triggers builds and streams logs"
 
@@ -33,6 +33,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 anyhow = "1"
+hostname = "0.4"
 
 # HTTP client (for callback)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

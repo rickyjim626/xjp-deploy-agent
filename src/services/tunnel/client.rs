@@ -24,6 +24,7 @@ const READ_BUFFER_SIZE: usize = 65536;
 /// 启动隧道客户端
 pub async fn start(state: Arc<AppState>) {
     let server_url = state.tunnel_server_url.clone();
+    let client_id = state.tunnel_client_id.clone();
     let auth_token = state.tunnel_auth_token.clone();
     let mappings = state.tunnel_port_mappings.clone();
     let client_state = state.tunnel_client_state.clone();
@@ -35,6 +36,7 @@ pub async fn start(state: Arc<AppState>) {
 
     info!(
         server_url = %server_url,
+        client_id = %client_id,
         mappings = mappings.len(),
         "Starting tunnel client"
     );
@@ -44,7 +46,7 @@ pub async fn start(state: Arc<AppState>) {
         *client_state.connected.write().await = false;
         *client_state.connected_at.write().await = None;
 
-        match run_client(&server_url, &auth_token, &mappings, client_state.clone()).await {
+        match run_client(&server_url, &client_id, &auth_token, &mappings, client_state.clone()).await {
             Ok(()) => {
                 info!("Tunnel client disconnected normally");
             }
@@ -67,6 +69,7 @@ pub async fn start(state: Arc<AppState>) {
 /// 运行客户端连接
 async fn run_client(
     server_url: &str,
+    client_id: &str,
     auth_token: &str,
     mappings: &[PortMapping],
     client_state: Arc<crate::state::TunnelClientState>,
@@ -97,13 +100,14 @@ async fn run_client(
     *client_state.connected_at.write().await = Some(Utc::now());
     *client_state.last_error.write().await = None;
 
-    // 发送配置
+    // 发送配置（包含客户端 ID）
     let config_msg = TunnelMessage::Config {
+        client_id: client_id.to_string(),
         mappings: mappings.to_vec(),
     };
     let config_json = serde_json::to_string(&config_msg)?;
     ws_tx.send(Message::Text(config_json)).await?;
-    info!(mappings = mappings.len(), "Sent tunnel configuration");
+    info!(client_id = %client_id, mappings = mappings.len(), "Sent tunnel configuration");
 
     // 本地连接管理
     let (local_tx, mut local_rx) = mpsc::channel::<TunnelMessage>(256);
