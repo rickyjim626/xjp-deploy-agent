@@ -400,6 +400,13 @@ async fn restart_self_windows(
     use std::io::Write;
 
     let binary_str = binary_path.to_string_lossy().replace('\\', "\\\\");
+
+    // 获取二进制所在目录作为工作目录
+    let work_dir = binary_path
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "\\\\"))
+        .unwrap_or_default();
+
     let args_str = if args.len() > 1 {
         args[1..].join(" ")
     } else {
@@ -409,34 +416,34 @@ async fn restart_self_windows(
     // 创建 PowerShell 重启脚本
     let ps_script = format!(
         r#"
-# XJP Deploy Agent 自动更新脚本
-$ErrorActionPreference = 'SilentlyContinue'
+# XJP Deploy Agent Auto-Update Script
+$ErrorActionPreference = 'Stop'
 
-# 等待旧进程退出
+# Wait for old process to exit
+Start-Sleep -Seconds 3
+
+# Try to stop old process (just in case)
+Get-Process -Name 'xjp-deploy-agent' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+# Wait for file to be released
 Start-Sleep -Seconds 2
 
-# 尝试停止旧进程 (以防万一)
-Get-Process -Name 'xjp-deploy-agent' | Stop-Process -Force
-
-# 再等待一下确保文件释放
-Start-Sleep -Seconds 1
-
-# 启动新版本
+# Start new version with working directory
 $binary = "{binary}"
-$args = "{args}"
+$workDir = "{work_dir}"
 
-if ($args) {{
-    Start-Process -FilePath $binary -ArgumentList $args -WindowStyle Hidden
-}} else {{
-    Start-Process -FilePath $binary -WindowStyle Hidden
-}}
+Set-Location -Path $workDir
+Start-Process -FilePath $binary -WorkingDirectory $workDir
 
-# 清理脚本自身
-Start-Sleep -Seconds 1
-Remove-Item -Path $MyInvocation.MyCommand.Path -Force
+# Log success
+"Update completed at $(Get-Date)" | Out-File -FilePath "$workDir\update.log" -Append
+
+# Cleanup script
+Start-Sleep -Seconds 2
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 "#,
         binary = binary_str,
-        args = args_str
+        work_dir = work_dir
     );
 
     // 写入临时脚本文件

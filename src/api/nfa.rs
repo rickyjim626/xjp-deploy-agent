@@ -34,6 +34,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/nfa/stop", post(stop))
         .route("/nfa/restart", post(restart))
         .route("/nfa/logs", get(get_logs))
+        .route("/nfa/jobs", get(get_jobs))
         .route("/nfa/align", post(align))
 }
 
@@ -109,6 +110,23 @@ async fn get_logs(
 
     let lines = nfa.tail_logs(q.tail).await;
     Ok(Json(serde_json::json!({ "lines": lines })))
+}
+
+async fn get_jobs(
+    _auth: RequireApiKey,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let nfa = state
+        .nfa
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("NFA disabled".to_string()))?;
+
+    let jobs = nfa
+        .get_jobs()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(jobs))
 }
 
 async fn align(

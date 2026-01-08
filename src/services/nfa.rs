@@ -180,6 +180,44 @@ impl NfaSupervisor {
         Ok(resp.status().is_success())
     }
 
+    /// Get jobs from the NFA Python service
+    pub async fn get_jobs(&self) -> Result<serde_json::Value, String> {
+        if !self.config.enabled {
+            return Err("NFA is disabled (NFA_ENABLED=false)".to_string());
+        }
+
+        let (running, _) = self.process_state().await;
+        if !running {
+            return Ok(serde_json::json!({
+                "jobs": [],
+                "total": 0,
+                "message": "NFA service is not running"
+            }));
+        }
+
+        let url = format!("{}/jobs", self.local_base_url());
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("NFA jobs request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("NFA jobs error {}: {}", status, text));
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid NFA jobs JSON: {}", e))?;
+
+        Ok(json)
+    }
+
     pub async fn start(&self) -> Result<(), String> {
         if !self.config.enabled {
             return Err("NFA is disabled (NFA_ENABLED=false)".to_string());

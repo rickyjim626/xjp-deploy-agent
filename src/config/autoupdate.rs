@@ -32,31 +32,17 @@ pub struct AutoUpdateConfig {
 impl AutoUpdateConfig {
     /// 从环境变量加载配置
     pub fn from_env() -> Option<Self> {
-        // Debug: 打印原始环境变量值
-        let enabled_raw = env::var("AUTO_UPDATE_ENABLED");
-        eprintln!("[auto-update] AUTO_UPDATE_ENABLED raw = {:?}", enabled_raw);
-
-        let enabled = enabled_raw
+        let enabled = env::var("AUTO_UPDATE_ENABLED")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-
-        eprintln!("[auto-update] enabled = {}", enabled);
 
         if !enabled {
             return None;
         }
 
-        let endpoint = env::var("UPDATE_ENDPOINT");
-        let metadata_path = env::var("UPDATE_METADATA_PATH");
-        let binary_path_template = env::var("UPDATE_BINARY_PATH_TEMPLATE");
-
-        eprintln!("[auto-update] UPDATE_ENDPOINT = {:?}", endpoint);
-        eprintln!("[auto-update] UPDATE_METADATA_PATH = {:?}", metadata_path);
-        eprintln!("[auto-update] UPDATE_BINARY_PATH_TEMPLATE = {:?}", binary_path_template);
-
-        let endpoint = endpoint.ok()?;
-        let metadata_path = metadata_path.ok()?;
-        let binary_path_template = binary_path_template.ok()?;
+        let endpoint = env::var("UPDATE_ENDPOINT").ok()?;
+        let metadata_path = env::var("UPDATE_METADATA_PATH").ok()?;
+        let binary_path_template = env::var("UPDATE_BINARY_PATH_TEMPLATE").ok()?;
         let check_interval_secs = env::var("UPDATE_CHECK_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
