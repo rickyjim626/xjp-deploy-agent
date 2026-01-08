@@ -30,9 +30,9 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/tunnel/status", get(get_tunnel_status))
         .route("/tunnel/ws", get(tunnel_websocket_handler))
-        .route("/tunnel/proxy/{client_id}", any(tunnel_proxy_handler))
-        .route("/tunnel/proxy/{client_id}/", any(tunnel_proxy_handler))
-        .route("/tunnel/proxy/{client_id}/*path", any(tunnel_proxy_handler))
+        .route("/tunnel/proxy/:client_id", any(tunnel_proxy_handler))
+        .route("/tunnel/proxy/:client_id/", any(tunnel_proxy_handler))
+        .route("/tunnel/proxy/:client_id/*path", any(tunnel_proxy_handler))
 }
 
 /// 获取隧道状态
