@@ -11,7 +11,6 @@
 #![cfg(windows)]
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 use windows_service::{
@@ -157,7 +156,7 @@ pub fn is_running_as_service() -> bool {
 
 /// Restart the service (for auto-update)
 /// This schedules a restart via sc.exe since we can't restart ourselves
-pub fn schedule_service_restart() -> Result<(), Box<dyn std::error::Error>> {
+pub fn schedule_service_restart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create a batch script that will restart the service after a delay
     let script_content = format!(
         r#"@echo off
@@ -231,11 +230,11 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), Box<dyn std::error::Erro
     }
 
     // Run the actual agent in a separate thread
-    let agent_handle = std::thread::spawn(|| {
+    let _agent_handle = std::thread::spawn(|| {
         // Create a new tokio runtime for the service
         let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
         rt.block_on(async {
-            crate::run_agent().await;
+            crate::init_and_run_agent().await;
         });
     });
 
