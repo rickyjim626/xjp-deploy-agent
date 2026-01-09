@@ -38,7 +38,7 @@ pub fn load_env_file() {
 
     for path in &env_paths {
         if path.exists() {
-            match dotenvy::from_path(path) {
+            match dotenvy::from_path_override(path) {
                 Ok(_) => {
                     eprintln!("[init] Loaded env from: {}", path.display());
                     break;
