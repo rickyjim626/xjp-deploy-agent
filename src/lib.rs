@@ -15,7 +15,6 @@ use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    api,
     config::env::constants::{QUEUE_TIMEOUT_SECS, VERSION},
     domain::{deploy::DeployStatus, tunnel::TunnelMode},
     services::ssh::SshServer,
