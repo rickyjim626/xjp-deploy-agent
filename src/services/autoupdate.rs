@@ -269,11 +269,9 @@ async fn run_canary_health_check(binary_path: &PathBuf) -> bool {
     );
 
     // 启动 canary 进程
-    // 注意：通过环境变量配置而不是 CLI 参数，因为 main.rs 不支持 CLI 参数
+    // 使用命令行参数 --port 和 --canary，避免环境变量被 .env 文件覆盖
     let canary_result = Command::new(binary_path)
-        .env("PORT", CANARY_PORT.to_string())
-        .env("AUTO_UPDATE_ENABLED", "false") // 禁用 canary 的自动更新
-        .env("DEPLOY_AGENT_API_KEY", "canary-health-check") // 提供必要的配置
+        .args(["--port", &CANARY_PORT.to_string(), "--canary"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -348,134 +346,57 @@ async fn run_canary_health_check(binary_path: &PathBuf) -> bool {
 }
 
 /// 重启当前进程
+///
+/// 使用统一的 RestartManager 处理不同平台的重启逻辑
 async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 获取当前进程的参数
-    let args: Vec<String> = std::env::args().collect();
+    use crate::services::restart::{RestartManager, RestartMode};
 
     tracing::info!(
         binary = %binary_path.display(),
-        args = ?args,
-        "Restarting process"
+        "Restarting process via RestartManager"
     );
 
-    // 在 Unix 系统上使用 exec 替换当前进程
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(binary_path)
-            .args(&args[1..])
-            .exec();
-        // 如果 exec 返回，说明出错了
-        return Err(format!("exec failed: {}", err).into());
-    }
-
-    // 在 Windows 系统上，使用 PowerShell 脚本延迟重启
+    // 检测运行模式
     #[cfg(windows)]
-    {
-        restart_self_windows(binary_path, &args).await?;
-        return Ok(()); // Windows 函数处理了退出
-    }
+    let mode = {
+        use crate::services::windows_service;
+        if windows_service::is_running_as_service() {
+            tracing::info!("Detected Windows service mode");
+            RestartMode::Service
+        } else {
+            tracing::info!("Detected Windows console mode");
+            RestartMode::Console(binary_path.clone())
+        }
+    };
+
+    #[cfg(unix)]
+    let mode = {
+        // Unix 系统检测是否作为 systemd 服务运行
+        if std::env::var("INVOCATION_ID").is_ok() {
+            tracing::info!("Detected systemd service mode");
+            RestartMode::Service
+        } else {
+            tracing::info!("Detected console mode");
+            RestartMode::Console(binary_path.clone())
+        }
+    };
 
     #[cfg(not(any(unix, windows)))]
-    {
-        // Fallback for other platforms
-        std::process::Command::new(binary_path)
-            .args(&args[1..])
-            .spawn()?;
-        std::process::exit(0);
-    }
-}
+    let mode = RestartMode::Console(binary_path.clone());
 
-/// Windows 专用重启函数
-///
-/// 根据运行模式选择重启策略：
-/// - 服务模式：使用 Windows Service Control Manager 重启
-/// - 控制台模式：使用 batch 脚本重启
-#[cfg(windows)]
-async fn restart_self_windows(
-    binary_path: &PathBuf,
-    _args: &[String],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use crate::services::windows_service;
+    // 调度重启
+    RestartManager::schedule_restart(mode)
+        .await
+        .map_err(|e| format!("Failed to schedule restart: {}", e))?;
 
-    // 检查是否作为服务运行
-    if windows_service::is_running_as_service() {
-        tracing::info!("Running as service, scheduling service restart via SCM");
-        windows_service::schedule_service_restart()?;
-        // 给脚本一点时间启动
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        tracing::info!("Exiting for service restart...");
-        std::process::exit(0);
-    }
+    // 给重启调度一点时间启动
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    // 控制台模式：使用 batch 脚本重启
-    tracing::info!("Running in console mode, using batch script restart");
-    restart_self_windows_console(binary_path).await
-}
-
-/// 控制台模式的 Windows 重启函数
-#[cfg(windows)]
-async fn restart_self_windows_console(
-    binary_path: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::io::Write;
-
-    let binary_str = binary_path.to_string_lossy().replace('\\', "\\\\");
-
-    // 获取二进制所在目录作为工作目录
-    let work_dir = binary_path
-        .parent()
-        .map(|p| p.to_string_lossy().replace('\\', "\\\\"))
-        .unwrap_or_default();
-
-    // 创建 batch 重启脚本 (opens new console window)
-    let batch_script = format!(
-        r#"@echo off
-title XJP Deploy Agent - Auto Update
-echo Waiting for old process to exit...
-timeout /t 3 /nobreak > nul
-
-echo Stopping any remaining processes...
-taskkill /F /IM xjp-deploy-agent.exe > nul 2>&1
-
-echo Waiting for file release...
-timeout /t 2 /nobreak > nul
-
-echo Starting new version...
-cd /d "{work_dir}"
-echo Update completed at %DATE% %TIME% >> update.log
-start "" "{binary}"
-
-echo Cleaning up...
-timeout /t 2 /nobreak > nul
-del "%~f0"
-"#,
-        binary = binary_str,
-        work_dir = work_dir
-    );
-
-    // 写入临时脚本文件
-    let script_path = std::env::temp_dir().join("xjp-deploy-agent-update.bat");
-    let mut file = std::fs::File::create(&script_path)?;
-    file.write_all(batch_script.as_bytes())?;
-    drop(file);
-
-    tracing::info!(
-        script = %script_path.display(),
-        "Starting batch update script"
-    );
-
-    // 启动 batch 脚本 (opens new console window)
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", script_path.to_str().unwrap()])
-        .spawn()?;
-
-    // 给脚本一点时间启动
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    tracing::info!("Exiting for update...");
+    tracing::info!("Exiting for restart...");
     std::process::exit(0);
 }
+
+// Note: Windows restart functions have been moved to services::restart::RestartManager
 
 /// 获取更新元数据
 async fn fetch_update_metadata(

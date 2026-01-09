@@ -211,100 +211,62 @@ async fn list_projects(
 ///
 /// POST /restart
 /// 需要 API Key 认证
+///
+/// 使用统一的 RestartManager 处理不同平台的重启逻辑
 async fn restart_service(
     _auth: RequireApiKey,
     State(_state): State<Arc<AppState>>,
 ) -> ApiResult<Json<RestartResponse>> {
-    tracing::info!("Restart requested, scheduling service restart in 2 seconds...");
+    use crate::services::restart::{RestartManager, RestartMode};
 
-    #[cfg(target_os = "windows")]
-    let result = restart_windows_service().await;
+    tracing::info!("Restart requested via API, scheduling restart...");
 
-    #[cfg(not(target_os = "windows"))]
-    let result = restart_linux_service().await;
-
-    result
-}
-
-/// Linux: 使用 systemd-run 延迟重启服务
-#[cfg(not(target_os = "windows"))]
-async fn restart_linux_service() -> ApiResult<Json<RestartResponse>> {
-    let result = tokio::process::Command::new("sudo")
-        .args([
-            "/usr/bin/systemd-run",
-            "--no-block",
-            "--on-active=2s",
-            "/bin/systemctl",
-            "restart",
-            "xjp-deploy-agent",
-        ])
-        .output()
-        .await;
-
-    match result {
-        Ok(output) => {
-            if output.status.success() {
-                tracing::info!("Service restart scheduled successfully (Linux/systemd)");
-                Ok(Json(RestartResponse {
-                    success: true,
-                    message: "Service restart scheduled in 2 seconds".to_string(),
-                }))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::error!("Failed to schedule restart: {}", stderr);
-                Ok(Json(RestartResponse {
-                    success: false,
-                    message: format!("Failed to schedule restart: {}", stderr),
-                }))
-            }
+    // 检测运行模式
+    #[cfg(windows)]
+    let mode = {
+        use crate::services::windows_service;
+        if windows_service::is_running_as_service() {
+            RestartMode::Service
+        } else {
+            RestartMode::Console(std::env::current_exe().unwrap_or_default())
         }
-        Err(e) => {
-            tracing::error!("Failed to run systemd-run: {}", e);
+    };
+
+    #[cfg(unix)]
+    let mode = {
+        // Unix 系统检测是否作为 systemd 服务运行
+        if std::env::var("INVOCATION_ID").is_ok() {
+            RestartMode::Service
+        } else {
+            RestartMode::Console(std::env::current_exe().unwrap_or_default())
+        }
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let mode = RestartMode::Console(std::env::current_exe().unwrap_or_default());
+
+    // 调度重启
+    match RestartManager::schedule_restart(mode).await {
+        Ok(()) => {
+            tracing::info!("Restart scheduled successfully");
+
+            // 调度成功后，安排进程退出
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tracing::info!("Exiting for restart...");
+                std::process::exit(0);
+            });
+
             Ok(Json(RestartResponse {
-                success: false,
-                message: format!("Failed to run restart command: {}", e),
+                success: true,
+                message: "Service restart scheduled".to_string(),
             }))
         }
-    }
-}
-
-/// Windows: 使用 PowerShell 延迟重启服务
-#[cfg(target_os = "windows")]
-async fn restart_windows_service() -> ApiResult<Json<RestartResponse>> {
-    // 使用 PowerShell 在后台延迟 2 秒后重启服务
-    // Start-Job 在后台运行，不会阻塞当前进程
-    let result = tokio::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Start-Job -ScriptBlock { Start-Sleep -Seconds 2; Restart-Service -Name 'xjp-deploy-agent' -Force }",
-        ])
-        .output()
-        .await;
-
-    match result {
-        Ok(output) => {
-            if output.status.success() {
-                tracing::info!("Service restart scheduled successfully (Windows/PowerShell)");
-                Ok(Json(RestartResponse {
-                    success: true,
-                    message: "Service restart scheduled in 2 seconds".to_string(),
-                }))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                tracing::error!("Failed to schedule restart: {} {}", stderr, stdout);
-                Ok(Json(RestartResponse {
-                    success: false,
-                    message: format!("Failed to schedule restart: {} {}", stderr, stdout),
-                }))
-            }
-        }
         Err(e) => {
-            tracing::error!("Failed to run PowerShell: {}", e);
+            tracing::error!(error = %e, "Failed to schedule restart");
             Ok(Json(RestartResponse {
                 success: false,
-                message: format!("Failed to run restart command: {}", e),
+                message: format!("Failed to schedule restart: {}", e),
             }))
         }
     }

@@ -21,6 +21,15 @@ use crate::{
     state::AppState,
 };
 
+/// 运行时配置（由命令行参数提供）
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeConfig {
+    /// 覆盖监听端口
+    pub port_override: Option<u16>,
+    /// Canary 模式（禁用自动更新）
+    pub canary_mode: bool,
+}
+
 /// Load environment file from various locations
 pub fn load_env_file() {
     let env_paths = [
@@ -53,16 +62,26 @@ pub fn load_env_file() {
     }
 }
 
-/// Initialize environment and run the agent
+/// Initialize environment and run the agent (默认配置)
 pub async fn init_and_run_agent() {
+    init_and_run_agent_with_config(RuntimeConfig::default()).await;
+}
+
+/// Initialize environment and run the agent with runtime config
+pub async fn init_and_run_agent_with_config(config: RuntimeConfig) {
     // Load .env file if exists
     load_env_file();
     // Run the main agent logic
-    run_agent().await;
+    run_agent_with_config(config).await;
 }
 
-/// Main agent logic - can be called from console mode or service mode
+/// Main agent logic - can be called from console mode or service mode (默认配置)
 pub async fn run_agent() {
+    run_agent_with_config(RuntimeConfig::default()).await;
+}
+
+/// Main agent logic with runtime config
+pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
     // 1. 初始化日志
     tracing_subscriber::registry()
         .with(
@@ -72,10 +91,25 @@ pub async fn run_agent() {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    tracing::info!(version = VERSION, "Starting xjp-deploy-agent");
+    let mode_str = if runtime_config.canary_mode { " (canary mode)" } else { "" };
+    tracing::info!(version = VERSION, mode = mode_str, "Starting xjp-deploy-agent");
 
-    // 2. 创建应用状态
-    let state = Arc::new(AppState::new());
+    // 2. 创建应用状态（应用运行时配置覆盖）
+    let mut state = AppState::new();
+
+    // 应用端口覆盖
+    if let Some(port) = runtime_config.port_override {
+        tracing::info!(port = port, "Port overridden by command line");
+        state.config.port = port;
+    }
+
+    // Canary 模式禁用自动更新
+    if runtime_config.canary_mode {
+        tracing::info!("Canary mode: auto-update disabled");
+        state.auto_update_config = None;
+    }
+
+    let state = Arc::new(state);
 
     tracing::info!(
         port = state.config.port,

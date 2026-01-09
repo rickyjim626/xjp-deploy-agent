@@ -9,6 +9,7 @@ pub mod nfa;
 pub mod ssh;
 pub mod tunnel;
 pub mod log_reporter;
+pub mod restart;
 
 #[cfg(windows)]
 pub mod windows_service;

@@ -6,9 +6,66 @@
 //!
 //! Usage:
 //! - Normal mode: `xjp-deploy-agent.exe`
+//! - With custom port: `xjp-deploy-agent.exe --port 19999`
+//! - Canary mode: `xjp-deploy-agent.exe --port 19999 --canary`
 //! - Install service: `xjp-deploy-agent.exe service install`
 //! - Uninstall service: `xjp-deploy-agent.exe service uninstall`
 //! - Run as service: `xjp-deploy-agent.exe service run` (called by SCM)
+
+use xjp_deploy_agent::RuntimeConfig;
+
+/// 解析命令行参数
+fn parse_args() -> RuntimeConfig {
+    let args: Vec<String> = std::env::args().collect();
+    let mut config = RuntimeConfig::default();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" if i + 1 < args.len() => {
+                config.port_override = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--canary" => {
+                config.canary_mode = true;
+                i += 1;
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "service" => {
+                // service 子命令由后面处理
+                break;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    config
+}
+
+fn print_help() {
+    println!("XJP Deploy Agent - 私有云部署代理");
+    println!();
+    println!("USAGE:");
+    println!("    xjp-deploy-agent [OPTIONS] [COMMAND]");
+    println!();
+    println!("OPTIONS:");
+    println!("    --port <PORT>    Override the listening port");
+    println!("    --canary         Run in canary mode (disables auto-update)");
+    println!("    -h, --help       Print help information");
+    println!();
+    println!("COMMANDS:");
+    println!("    service          Windows service management");
+    println!();
+    println!("EXAMPLES:");
+    println!("    xjp-deploy-agent                      # Normal mode");
+    println!("    xjp-deploy-agent --port 19999         # Custom port");
+    println!("    xjp-deploy-agent --port 19999 --canary  # Canary health check");
+}
 
 fn main() {
     // Parse command line arguments
@@ -23,14 +80,17 @@ fn main() {
         }
     }
 
+    // Parse runtime config from command line
+    let config = parse_args();
+
     // Suppress unused variable warning on non-Windows
     #[cfg(not(windows))]
-    let _ = args;
+    let _ = &args;
 
     // Normal console mode - run with tokio runtime
     let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
     rt.block_on(async {
-        xjp_deploy_agent::init_and_run_agent().await;
+        xjp_deploy_agent::init_and_run_agent_with_config(config).await;
     });
 }
 

@@ -154,31 +154,7 @@ pub fn is_running_as_service() -> bool {
     args.len() >= 3 && args[1] == "service" && args[2] == "run"
 }
 
-/// Restart the service (for auto-update)
-/// This schedules a restart via sc.exe since we can't restart ourselves
-pub fn schedule_service_restart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Create a batch script that will restart the service after a delay
-    let script_content = format!(
-        r#"@echo off
-timeout /t 3 /nobreak > nul
-net stop {} > nul 2>&1
-timeout /t 2 /nobreak > nul
-net start {}
-del "%~f0"
-"#,
-        SERVICE_NAME, SERVICE_NAME
-    );
-
-    let script_path = std::env::temp_dir().join("xjp-deploy-agent-restart.bat");
-    std::fs::write(&script_path, script_content)?;
-
-    // Run the script detached
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "/B", "", script_path.to_str().unwrap()])
-        .spawn()?;
-
-    Ok(())
-}
+// Note: schedule_service_restart has been moved to services::restart::RestartManager
 
 // Define the Windows service entry point
 define_windows_service!(ffi_service_main, service_main);
