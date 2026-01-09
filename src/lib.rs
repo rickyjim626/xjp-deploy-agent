@@ -38,7 +38,9 @@ pub fn load_env_file() {
 
     for path in &env_paths {
         if path.exists() {
-            match dotenvy::from_path_override(path) {
+            // Use from_path() instead of from_path_override() to preserve
+            // environment variables set via command line (e.g., canary PORT)
+            match dotenvy::from_path(path) {
                 Ok(_) => {
                     eprintln!("[init] Loaded env from: {}", path.display());
                     break;
