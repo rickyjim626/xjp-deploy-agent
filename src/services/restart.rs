@@ -122,24 +122,62 @@ impl RestartManager {
         }
     }
 
-    /// Windows 服务模式: 使用 schtasks 创建一次性计划任务
+    /// Windows 服务模式: 依赖服务恢复选项自动重启
     ///
-    /// 这是最可靠的方式，因为计划任务由 Task Scheduler 服务管理，
-    /// 完全独立于当前进程
+    /// 最可靠的方式是利用 Windows 服务恢复机制：
+    /// 1. 服务安装时配置了 failure recovery (restart/5000/restart/10000/restart/30000)
+    /// 2. 当服务退出（即使 exit code 0）Windows 会在 5 秒后自动重启
+    /// 3. 这种方式完全由 Windows SCM 管理，最可靠
+    ///
+    /// 备选方案：使用 schtasks 创建计划任务（作为双保险）
     #[cfg(windows)]
     async fn restart_windows_service() -> Result<(), RestartError> {
+        // 方案1: 尝试配置服务恢复（如果尚未配置）
+        // 这确保即使安装时配置失败，更新时也能配置
+        // Note: sc failure expects separate arguments for the values
+        let recovery_result = tokio::process::Command::new("sc")
+            .args([
+                "failure",
+                "xjp-deploy-agent",
+                "reset=",
+                "0",  // 不重置计数器
+                "actions=",
+                "restart/3000/restart/5000/restart/10000",
+            ])
+            .output()
+            .await;
+
+        if let Ok(output) = recovery_result {
+            if output.status.success() {
+                tracing::info!("Service recovery options configured - Windows will auto-restart on exit");
+                // 服务恢复已配置，直接退出进程，Windows 会自动重启
+                return Ok(());
+            }
+        }
+
+        // 方案2: 回退到 schtasks（双保险）
+        tracing::warn!("Service recovery config failed, falling back to schtasks");
+        Self::restart_via_schtasks().await
+    }
+
+    /// 使用 schtasks 创建计划任务重启服务
+    #[cfg(windows)]
+    async fn restart_via_schtasks() -> Result<(), RestartError> {
         use chrono::{Local, Duration};
 
         let task_name = "XJPDeployAgentRestart";
 
-        // 计算 5 秒后的时间（给当前请求足够的响应时间）
-        let run_time = Local::now() + Duration::seconds(5);
-        let time_str = run_time.format("%H:%M:%S").to_string();
-        let date_str = run_time.format("%Y-%m-%d").to_string();
+        // 计算 10 秒后的时间
+        let run_time = Local::now() + Duration::seconds(10);
+        // Windows schtasks 需要 HH:MM 格式（不带秒）
+        let time_str = run_time.format("%H:%M").to_string();
+        // 日期格式使用 Windows 通用格式 MM/DD/YYYY
+        let date_str = run_time.format("%m/%d/%Y").to_string();
 
         tracing::info!(
             task_name = %task_name,
             scheduled_time = %time_str,
+            scheduled_date = %date_str,
             "Creating scheduled task for service restart"
         );
 
@@ -149,9 +187,8 @@ impl RestartManager {
             .output()
             .await;
 
-        // 创建重启命令：先停止再启动
-        // 使用 cmd /c 确保两个命令都能执行
-        let restart_cmd = "cmd /c \"net stop xjp-deploy-agent & timeout /t 2 /nobreak >nul & net start xjp-deploy-agent\"";
+        // 创建重启命令
+        let restart_cmd = "cmd /c \"net stop xjp-deploy-agent & timeout /t 3 /nobreak >nul & net start xjp-deploy-agent\"";
 
         // 创建新的一次性任务
         let result = tokio::process::Command::new("schtasks")
@@ -162,9 +199,9 @@ impl RestartManager {
                 "/SC", "ONCE",
                 "/ST", &time_str,
                 "/SD", &date_str,
-                "/RU", "SYSTEM",  // 以 SYSTEM 账户运行，有权限管理服务
-                "/RL", "HIGHEST", // 最高权限
-                "/F",             // 强制覆盖
+                "/RU", "SYSTEM",
+                "/RL", "HIGHEST",
+                "/F",
             ])
             .output()
             .await?;

@@ -65,6 +65,30 @@ pub fn install_service() -> Result<(), Box<dyn std::error::Error>> {
     // Set service description
     service.set_description(SERVICE_DESCRIPTION)?;
 
+    // Configure service recovery options using sc command
+    // This ensures the service auto-restarts on failure (including during updates)
+    // Note: sc failure expects arguments like "reset= 86400" with space after =
+    let recovery_result = std::process::Command::new("sc")
+        .args([
+            "failure",
+            SERVICE_NAME,
+            "reset=",
+            "86400",      // Reset failure count after 1 day
+            "actions=",
+            "restart/3000/restart/5000/restart/10000", // Restart after 3s, 5s, 10s
+        ])
+        .output();
+
+    if let Ok(output) = recovery_result {
+        if output.status.success() {
+            println!("Service recovery options configured (auto-restart on failure)");
+        } else {
+            // Log the error but don't fail installation
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Warning: Failed to configure recovery options: {}", stderr);
+        }
+    }
+
     println!("Service '{}' installed successfully!", SERVICE_NAME);
     println!("Binary path: {}", service_binary_path.display());
     println!("Working directory: {}", work_dir.display());
