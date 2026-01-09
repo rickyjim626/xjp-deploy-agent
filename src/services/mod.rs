@@ -9,3 +9,6 @@ pub mod nfa;
 pub mod ssh;
 pub mod tunnel;
 pub mod log_reporter;
+
+#[cfg(windows)]
+pub mod windows_service;

@@ -388,14 +388,35 @@ async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::E
 
 /// Windows 专用重启函数
 ///
-/// 由于 Windows 无法替换正在运行的 EXE，我们使用 PowerShell 脚本：
-/// 1. 当前进程退出
-/// 2. PowerShell 等待并复制新二进制
-/// 3. PowerShell 启动新版本
+/// 根据运行模式选择重启策略：
+/// - 服务模式：使用 Windows Service Control Manager 重启
+/// - 控制台模式：使用 batch 脚本重启
 #[cfg(windows)]
 async fn restart_self_windows(
     binary_path: &PathBuf,
-    args: &[String],
+    _args: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::services::windows_service;
+
+    // 检查是否作为服务运行
+    if windows_service::is_running_as_service() {
+        tracing::info!("Running as service, scheduling service restart via SCM");
+        windows_service::schedule_service_restart()?;
+        // 给脚本一点时间启动
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tracing::info!("Exiting for service restart...");
+        std::process::exit(0);
+    }
+
+    // 控制台模式：使用 batch 脚本重启
+    tracing::info!("Running in console mode, using batch script restart");
+    restart_self_windows_console(binary_path).await
+}
+
+/// 控制台模式的 Windows 重启函数
+#[cfg(windows)]
+async fn restart_self_windows_console(
+    binary_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::io::Write;
 
@@ -407,66 +428,46 @@ async fn restart_self_windows(
         .map(|p| p.to_string_lossy().replace('\\', "\\\\"))
         .unwrap_or_default();
 
-    let args_str = if args.len() > 1 {
-        args[1..].join(" ")
-    } else {
-        String::new()
-    };
+    // 创建 batch 重启脚本 (opens new console window)
+    let batch_script = format!(
+        r#"@echo off
+title XJP Deploy Agent - Auto Update
+echo Waiting for old process to exit...
+timeout /t 3 /nobreak > nul
 
-    // 创建 PowerShell 重启脚本
-    let ps_script = format!(
-        r#"
-# XJP Deploy Agent Auto-Update Script
-$ErrorActionPreference = 'Stop'
+echo Stopping any remaining processes...
+taskkill /F /IM xjp-deploy-agent.exe > nul 2>&1
 
-# Wait for old process to exit
-Start-Sleep -Seconds 3
+echo Waiting for file release...
+timeout /t 2 /nobreak > nul
 
-# Try to stop old process (just in case)
-Get-Process -Name 'xjp-deploy-agent' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+echo Starting new version...
+cd /d "{work_dir}"
+echo Update completed at %DATE% %TIME% >> update.log
+start "" "{binary}"
 
-# Wait for file to be released
-Start-Sleep -Seconds 2
-
-# Start new version with working directory
-$binary = "{binary}"
-$workDir = "{work_dir}"
-
-Set-Location -Path $workDir
-Start-Process -FilePath $binary -WorkingDirectory $workDir
-
-# Log success
-"Update completed at $(Get-Date)" | Out-File -FilePath "$workDir\update.log" -Append
-
-# Cleanup script
-Start-Sleep -Seconds 2
-Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+echo Cleaning up...
+timeout /t 2 /nobreak > nul
+del "%~f0"
 "#,
         binary = binary_str,
         work_dir = work_dir
     );
 
     // 写入临时脚本文件
-    let script_path = std::env::temp_dir().join("xjp-deploy-agent-update.ps1");
+    let script_path = std::env::temp_dir().join("xjp-deploy-agent-update.bat");
     let mut file = std::fs::File::create(&script_path)?;
-    file.write_all(ps_script.as_bytes())?;
+    file.write_all(batch_script.as_bytes())?;
     drop(file);
 
     tracing::info!(
         script = %script_path.display(),
-        "Starting PowerShell update script"
+        "Starting batch update script"
     );
 
-    // 启动 PowerShell 脚本 (隐藏窗口)
-    std::process::Command::new("powershell")
-        .args([
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            script_path.to_str().unwrap(),
-        ])
+    // 启动 batch 脚本 (opens new console window)
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", script_path.to_str().unwrap()])
         .spawn()?;
 
     // 给脚本一点时间启动

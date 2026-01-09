@@ -1,6 +1,6 @@
 [package]
 name = "xjp-deploy-agent"
-version = "0.7.10"
+version = "0.8.0"
 edition = "2021"
 description = "Deploy agent for private cloud - triggers builds and streams logs"
 
@@ -55,3 +55,7 @@ hex = "0.4"
 russh = "0.46"
 russh-keys = "0.46"
 async-trait = "0.1"
+
+# Windows service support (Windows only)
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
