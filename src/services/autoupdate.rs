@@ -665,15 +665,38 @@ async fn fetch_update_metadata(
     Ok(metadata)
 }
 
-/// 通过 Mesh 解析最佳二进制下载 URL
+/// 通过 ServiceRouter 解析最佳二进制下载 URL
 ///
-/// 如果 Mesh 客户端可用且能解析 "rustfs" 服务，则使用解析到的端点 URL（可能是内网地址）；
-/// 否则使用配置中的默认端点 URL。
+/// 优先级：ServiceRouter (Local > LAN > Mesh > Config > Fallback) > MeshClient > Config
+/// 这样可以让同局域网的 agent 优先从 LAN peer 下载更新，大幅提升下载速度。
 async fn resolve_binary_url(state: &Arc<AppState>, config: &AutoUpdateConfig, version: &str) -> String {
     // 构建二进制路径（不包含端点）
     let binary_path = config.binary_path_template.replace("{version}", version);
 
-    // 尝试通过 Mesh 解析 RustFS 服务端点
+    // 1. 优先通过 ServiceRouter 解析（包含 LAN 发现）
+    if let Some(ref router) = state.service_router {
+        let endpoint = router.get_endpoint("rustfs").await;
+        if !endpoint.url.is_empty() && endpoint.healthy {
+            let resolved_url = format!("{}/{}", endpoint.url.trim_end_matches('/'), binary_path);
+            tracing::info!(
+                original_endpoint = %config.endpoint,
+                resolved_endpoint = %endpoint.url,
+                source = ?endpoint.source,
+                latency_ms = ?endpoint.latency_ms,
+                resolved_url = %resolved_url,
+                "Resolved RustFS endpoint via ServiceRouter"
+            );
+            return resolved_url;
+        }
+        tracing::debug!(
+            endpoint_url = %endpoint.url,
+            source = ?endpoint.source,
+            healthy = endpoint.healthy,
+            "ServiceRouter endpoint not usable, trying fallback"
+        );
+    }
+
+    // 2. 回退: 尝试直接通过 Mesh 解析（兼容旧逻辑）
     if let Some(ref mesh_client) = state.mesh_client {
         if mesh_client.is_enabled() {
             match mesh_client.get_service_url("rustfs").await {
@@ -683,7 +706,7 @@ async fn resolve_binary_url(state: &Arc<AppState>, config: &AutoUpdateConfig, ve
                         original_endpoint = %config.endpoint,
                         resolved_endpoint = %endpoint_url,
                         resolved_url = %resolved_url,
-                        "Resolved RustFS endpoint via Mesh (using LAN if available)"
+                        "Resolved RustFS endpoint via Mesh (fallback)"
                     );
                     return resolved_url;
                 }
@@ -691,14 +714,19 @@ async fn resolve_binary_url(state: &Arc<AppState>, config: &AutoUpdateConfig, ve
                     tracing::warn!(
                         error = %e,
                         fallback_endpoint = %config.endpoint,
-                        "Failed to resolve RustFS via Mesh, using fallback"
+                        "Failed to resolve RustFS via Mesh"
                     );
                 }
             }
         }
     }
 
-    // Fallback: 使用配置中的默认端点
+    // 3. 最终回退: 使用配置中的默认端点
+    tracing::info!(
+        endpoint = %config.endpoint,
+        binary_url = %config.binary_url(version),
+        "Using config endpoint for binary download"
+    );
     config.binary_url(version)
 }
 
