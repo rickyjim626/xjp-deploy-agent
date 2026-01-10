@@ -5,6 +5,7 @@
 pub mod deploy;
 pub mod autoupdate;
 pub mod frp;
+pub mod mesh;
 pub mod nfa;
 pub mod ssh;
 pub mod tunnel;

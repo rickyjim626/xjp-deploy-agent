@@ -28,6 +28,9 @@ pub struct RuntimeConfig {
     pub port_override: Option<u16>,
     /// Canary 模式（禁用自动更新）
     pub canary_mode: bool,
+    /// Takeover 模式（零断线更新）
+    /// 如果设置，客户端会发送 Takeover 请求而不是 Config
+    pub takeover_session_id: Option<String>,
 }
 
 /// Load environment file from various locations
@@ -163,9 +166,39 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
     if state.tunnel_mode == TunnelMode::Client {
         let state_clone = state.clone();
         let shutdown_token = state::app_state::get_shutdown_token();
-        tokio::spawn(async move {
-            services::tunnel::client::start(state_clone, shutdown_token).await;
-        });
+
+        // 检查是否是 Takeover 模式
+        if let Some(session_id) = runtime_config.takeover_session_id.clone() {
+            tracing::info!(session_id = %session_id, "Starting tunnel client in takeover mode");
+            tokio::spawn(async move {
+                let takeover_config = services::tunnel::client::TakeoverConfig {
+                    session_id,
+                    signal_file: None,
+                };
+                let result = services::tunnel::client::start_takeover(
+                    state_clone,
+                    takeover_config,
+                    shutdown_token,
+                ).await;
+                match result {
+                    services::tunnel::client::ClientResult::TakeoverSuccess => {
+                        tracing::info!("Takeover successful, running normally");
+                    }
+                    services::tunnel::client::ClientResult::TakeoverFailed(e) => {
+                        tracing::error!(error = %e, "Takeover failed, exiting");
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        tracing::info!(?result, "Tunnel client finished");
+                    }
+                }
+            });
+        } else {
+            // 正常模式
+            tokio::spawn(async move {
+                services::tunnel::client::start(state_clone, shutdown_token).await;
+            });
+        }
     }
 
     // 3.3 Service Mesh 客户端 (如果启用)

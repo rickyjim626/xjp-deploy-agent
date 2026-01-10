@@ -100,7 +100,97 @@ async fn run_server(
                                             "Client registered and ports bound"
                                         );
                                     }
-                                } else if let Some(cid) = &client_id {
+                                }
+                                // 处理 Takeover 消息（零断线热切换）
+                                else if let TunnelMessage::Takeover { client_id: cid, mappings, new_session_id } = &tunnel_msg {
+                                    if client_id.is_none() {
+                                        info!(
+                                            client_id = %cid,
+                                            new_session_id = %new_session_id,
+                                            "Processing takeover request"
+                                        );
+
+                                        // 查找旧客户端连接（如果存在）
+                                        let old_client_tx = {
+                                            let clients = server_state.clients.read().await;
+                                            clients.get(cid).map(|c| c.ws_tx.clone())
+                                        };
+
+                                        // 切换端口绑定到新连接
+                                        match port_manager
+                                            .switch_client_binding(cid, msg_tx.clone(), mappings)
+                                            .await
+                                        {
+                                            Ok(switched) => {
+                                                info!(
+                                                    client_id = %cid,
+                                                    switched_ports = switched,
+                                                    "Port bindings switched to new connection"
+                                                );
+
+                                                // 更新或创建客户端状态
+                                                if server_state.has_client(cid).await {
+                                                    // 更新现有客户端的 ws_tx
+                                                    let mut clients = server_state.clients.write().await;
+                                                    if let Some(client) = clients.get_mut(cid) {
+                                                        client.ws_tx = msg_tx.clone();
+                                                        client.client_addr = client_addr.clone();
+                                                    }
+                                                } else {
+                                                    // 创建新客户端状态
+                                                    let mut new_client = ClientState::new(
+                                                        cid.clone(),
+                                                        client_addr.clone(),
+                                                        msg_tx.clone(),
+                                                    );
+                                                    new_client.mappings = mappings.clone();
+                                                    server_state.add_client(new_client).await;
+                                                }
+
+                                                client_id = Some(cid.clone());
+
+                                                // 发送 TakeoverReady 到新进程
+                                                let ready_msg = TunnelMessage::TakeoverReady {
+                                                    session_id: new_session_id.clone(),
+                                                };
+                                                if let Err(e) = msg_tx.send(ready_msg).await {
+                                                    error!(error = %e, "Failed to send TakeoverReady");
+                                                }
+
+                                                // 发送 TakeoverComplete 到旧进程（如果存在）
+                                                if let Some(old_tx) = old_client_tx {
+                                                    let complete_msg = TunnelMessage::TakeoverComplete {
+                                                        new_session_id: new_session_id.clone(),
+                                                    };
+                                                    if let Err(e) = old_tx.send(complete_msg).await {
+                                                        debug!(error = %e, "Failed to send TakeoverComplete to old client (may have already disconnected)");
+                                                    } else {
+                                                        info!(client_id = %cid, "Sent TakeoverComplete to old client");
+                                                    }
+                                                }
+
+                                                info!(
+                                                    client_id = %cid,
+                                                    new_session_id = %new_session_id,
+                                                    "Takeover completed successfully"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    client_id = %cid,
+                                                    error = %e,
+                                                    "Takeover failed"
+                                                );
+                                                // 发送 TakeoverFailed 到新进程
+                                                let failed_msg = TunnelMessage::TakeoverFailed {
+                                                    error: e,
+                                                };
+                                                let _ = msg_tx.send(failed_msg).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                else if let Some(cid) = &client_id {
                                     // 将消息路由到 PortListenerManager 处理
                                     handle_client_message(
                                         tunnel_msg,
@@ -285,6 +375,18 @@ async fn handle_client_message(
                     warn!(request_id = %request_id, "Failed to send HTTP error response");
                 }
             }
+        }
+
+        // Takeover 相关消息在 run_server 主循环中处理，这里只是记录
+        TunnelMessage::Takeover { .. } => {
+            warn!(client_id = %client_id, "Unexpected Takeover message from already-registered client");
+        }
+
+        TunnelMessage::TakeoverReady { .. }
+        | TunnelMessage::TakeoverComplete { .. }
+        | TunnelMessage::TakeoverFailed { .. } => {
+            // 这些消息是 Server 发给 Client 的，Client 不应该发给 Server
+            warn!(client_id = %client_id, "Unexpected takeover response message from client");
         }
     }
 }

@@ -30,6 +30,12 @@ fn parse_args() -> RuntimeConfig {
                 config.canary_mode = true;
                 i += 1;
             }
+            "--takeover" if i + 1 < args.len() => {
+                // Takeover 模式：零断线更新
+                // 新进程会发送 Takeover 请求接管旧进程的端口绑定
+                config.takeover_session_id = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -54,12 +60,13 @@ fn print_help() {
     println!("    xjp-deploy-agent [OPTIONS] [COMMAND]");
     println!();
     println!("OPTIONS:");
-    println!("    --port <PORT>    Override the listening port");
-    println!("    --canary         Run in canary mode (disables auto-update)");
-    println!("    -h, --help       Print help information");
+    println!("    --port <PORT>        Override the listening port");
+    println!("    --canary             Run in canary mode (disables auto-update)");
+    println!("    --takeover <SID>     Zero-downtime takeover mode (internal use)");
+    println!("    -h, --help           Print help information");
     println!();
     println!("COMMANDS:");
-    println!("    service          Windows service management");
+    println!("    service              Windows service management");
     println!();
     println!("EXAMPLES:");
     println!("    xjp-deploy-agent                      # Normal mode");

@@ -29,6 +29,21 @@ pub enum ClientResult {
     Disconnected,
     /// 收到 shutdown 信号，优雅退出
     Shutdown,
+    /// 收到 TakeoverComplete，旧进程应该退出
+    TakeoverComplete,
+    /// Takeover 模式成功接管
+    TakeoverSuccess,
+    /// Takeover 模式失败
+    TakeoverFailed(String),
+}
+
+/// Takeover 模式配置
+#[derive(Debug, Clone)]
+pub struct TakeoverConfig {
+    /// 新进程的 session ID
+    pub session_id: String,
+    /// 信号文件路径（用于通知旧进程）
+    pub signal_file: Option<std::path::PathBuf>,
 }
 
 /// 启动隧道客户端
@@ -79,6 +94,16 @@ pub async fn start(state: Arc<AppState>, shutdown_token: CancellationToken) {
                 info!("Tunnel client shutdown gracefully");
                 break;
             }
+            Ok(ClientResult::TakeoverComplete) => {
+                info!("Tunnel client received takeover complete, new process has taken over, exiting");
+                // 新进程已接管，旧进程应该退出
+                // 注意：这里不 break，而是直接退出进程
+                // 因为自动更新场景下，新进程已经在运行了
+                std::process::exit(0);
+            }
+            Ok(result) => {
+                info!(?result, "Tunnel client returned unexpected result");
+            }
             Err(e) => {
                 error!(error = %e, "Tunnel client error");
                 *client_state.last_error.write().await = Some(e.to_string());
@@ -109,6 +134,263 @@ pub async fn start(state: Arc<AppState>, shutdown_token: CancellationToken) {
     }
 
     info!("Tunnel client stopped");
+}
+
+/// 启动隧道客户端（Takeover 模式）
+///
+/// 用于零断线更新：新进程连接后发送 Takeover 请求，
+/// 等待 Server 切换端口绑定后开始工作。
+pub async fn start_takeover(
+    state: Arc<AppState>,
+    takeover_config: TakeoverConfig,
+    shutdown_token: CancellationToken,
+) -> ClientResult {
+    let server_url = state.tunnel_server_url.clone();
+    let client_id = state.tunnel_client_id.clone();
+    let auth_token = state.tunnel_auth_token.clone();
+    let mappings = state.tunnel_port_mappings.clone();
+    let client_state = state.tunnel_client_state.clone();
+
+    if mappings.is_empty() {
+        warn!("No tunnel port mappings configured, takeover cannot proceed");
+        return ClientResult::TakeoverFailed("No port mappings".to_string());
+    }
+
+    info!(
+        server_url = %server_url,
+        client_id = %client_id,
+        session_id = %takeover_config.session_id,
+        "Starting tunnel client in takeover mode"
+    );
+
+    // 运行 takeover 客户端
+    match run_client_takeover(
+        &server_url,
+        &client_id,
+        &auth_token,
+        &mappings,
+        client_state.clone(),
+        shutdown_token.clone(),
+        &takeover_config,
+    )
+    .await
+    {
+        Ok(result) => {
+            match &result {
+                ClientResult::TakeoverSuccess => {
+                    info!("Takeover successful, writing signal file");
+                    // 写入信号文件通知旧进程
+                    if let Some(ref signal_path) = takeover_config.signal_file {
+                        if let Err(e) = tokio::fs::write(signal_path, "ready").await {
+                            warn!(error = %e, "Failed to write takeover signal file");
+                        }
+                    }
+                }
+                ClientResult::TakeoverFailed(e) => {
+                    error!(error = %e, "Takeover failed");
+                }
+                _ => {}
+            }
+            result
+        }
+        Err(e) => {
+            error!(error = %e, "Takeover connection error");
+            ClientResult::TakeoverFailed(e.to_string())
+        }
+    }
+}
+
+/// 运行 Takeover 模式的客户端连接
+async fn run_client_takeover(
+    server_url: &str,
+    client_id: &str,
+    auth_token: &str,
+    mappings: &[PortMapping],
+    client_state: Arc<crate::state::TunnelClientState>,
+    shutdown_token: CancellationToken,
+    takeover_config: &TakeoverConfig,
+) -> anyhow::Result<ClientResult> {
+    // 构建 WebSocket URL，添加认证 token 作为 header
+    let url = url::Url::parse(server_url)?;
+
+    // 创建请求，添加认证 header
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(server_url)
+        .header("x-tunnel-token", auth_token)
+        .header("Host", url.host_str().unwrap_or("localhost"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
+        .body(())?;
+
+    info!(url = %server_url, "Connecting to tunnel server (takeover mode)");
+
+    let (ws_stream, _) = connect_async(request).await?;
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+    info!("Connected to tunnel server, sending takeover request");
+
+    // 发送 Takeover 请求
+    let takeover_msg = TunnelMessage::Takeover {
+        client_id: client_id.to_string(),
+        mappings: mappings.to_vec(),
+        new_session_id: takeover_config.session_id.clone(),
+    };
+    let takeover_json = serde_json::to_string(&takeover_msg)?;
+    ws_tx.send(Message::Text(takeover_json)).await?;
+    info!(
+        client_id = %client_id,
+        session_id = %takeover_config.session_id,
+        "Sent takeover request, waiting for TakeoverReady"
+    );
+
+    // 等待 TakeoverReady 响应（带超时）
+    let takeover_timeout = Duration::from_secs(30);
+    let takeover_result = tokio::time::timeout(takeover_timeout, async {
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Ok(tunnel_msg) = serde_json::from_str::<TunnelMessage>(&text) {
+                        match tunnel_msg {
+                            TunnelMessage::TakeoverReady { session_id } => {
+                                if session_id == takeover_config.session_id {
+                                    info!(session_id = %session_id, "Received TakeoverReady");
+                                    return Ok(true);
+                                }
+                            }
+                            TunnelMessage::TakeoverFailed { error } => {
+                                error!(error = %error, "Received TakeoverFailed");
+                                return Err(error);
+                            }
+                            _ => {
+                                debug!(?tunnel_msg, "Ignoring message while waiting for TakeoverReady");
+                            }
+                        }
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    let _ = ws_tx.send(Message::Pong(data)).await;
+                }
+                Ok(Message::Close(_)) => {
+                    return Err("Server closed connection".to_string());
+                }
+                Err(e) => {
+                    return Err(format!("WebSocket error: {}", e));
+                }
+                _ => {}
+            }
+        }
+        Err("WebSocket stream ended".to_string())
+    })
+    .await;
+
+    match takeover_result {
+        Ok(Ok(true)) => {
+            // Takeover 成功，更新状态
+            *client_state.connected.write().await = true;
+            *client_state.connected_at.write().await = Some(Utc::now());
+            *client_state.last_error.write().await = None;
+
+            info!("Takeover successful, starting normal operation");
+
+            // 继续正常的客户端循环
+            let (local_tx, mut local_rx) = mpsc::channel::<TunnelMessage>(256);
+            let local_connections: Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>> =
+                Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+            let mut shutdown_triggered = false;
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        info!("Tunnel client received shutdown signal");
+                        shutdown_triggered = true;
+                        let _ = ws_tx.send(Message::Close(None)).await;
+                        break;
+                    }
+
+                    msg = ws_rx.next() => {
+                        match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                if let Ok(tunnel_msg) = serde_json::from_str::<TunnelMessage>(&text) {
+                                    handle_server_message(
+                                        tunnel_msg,
+                                        mappings,
+                                        local_tx.clone(),
+                                        local_connections.clone(),
+                                    ).await;
+                                }
+                            }
+                            Some(Ok(Message::Binary(data))) => {
+                                if let Ok(tunnel_msg) = serde_json::from_slice::<TunnelMessage>(&data) {
+                                    handle_server_message(
+                                        tunnel_msg,
+                                        mappings,
+                                        local_tx.clone(),
+                                        local_connections.clone(),
+                                    ).await;
+                                }
+                            }
+                            Some(Ok(Message::Ping(data))) => {
+                                let _ = ws_tx.send(Message::Pong(data)).await;
+                            }
+                            Some(Ok(Message::Close(_))) => {
+                                info!("Server closed connection");
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                error!(error = %e, "WebSocket error");
+                                break;
+                            }
+                            None => {
+                                info!("WebSocket stream ended");
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    Some(msg) = local_rx.recv() => {
+                        let json = serde_json::to_string(&msg)?;
+                        if let Err(e) = ws_tx.send(Message::Text(json)).await {
+                            error!(error = %e, "Failed to send message to server");
+                            break;
+                        }
+                    }
+
+                    _ = ping_interval.tick() => {
+                        let ping_msg = serde_json::to_string(&TunnelMessage::Ping)?;
+                        if let Err(e) = ws_tx.send(Message::Text(ping_msg)).await {
+                            error!(error = %e, "Failed to send ping");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 清理
+            let mut conns = local_connections.write().await;
+            conns.clear();
+            *client_state.connected.write().await = false;
+
+            if shutdown_triggered {
+                Ok(ClientResult::Shutdown)
+            } else {
+                Ok(ClientResult::TakeoverSuccess)
+            }
+        }
+        Ok(Ok(false)) => {
+            // 这个分支理论上不会发生，但编译器需要处理所有情况
+            warn!("Unexpected Ok(false) from takeover result");
+            Ok(ClientResult::TakeoverFailed("Unexpected takeover result".to_string()))
+        }
+        Ok(Err(e)) => Ok(ClientResult::TakeoverFailed(e)),
+        Err(_) => Ok(ClientResult::TakeoverFailed("Takeover timeout".to_string())),
+    }
 }
 
 /// 运行客户端连接
@@ -185,6 +467,21 @@ async fn run_client(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<TunnelMessage>(&text) {
                             Ok(tunnel_msg) => {
+                                // 检查是否收到 TakeoverComplete（新进程已接管）
+                                if let TunnelMessage::TakeoverComplete { new_session_id } = &tunnel_msg {
+                                    info!(
+                                        new_session_id = %new_session_id,
+                                        "Received TakeoverComplete, new process has taken over"
+                                    );
+                                    // 发送 Close 帧并退出
+                                    let _ = ws_tx.send(Message::Close(None)).await;
+                                    // 清理
+                                    let mut conns = local_connections.write().await;
+                                    conns.clear();
+                                    *client_state.connected.write().await = false;
+                                    return Ok(ClientResult::TakeoverComplete);
+                                }
+
                                 handle_server_message(
                                     tunnel_msg,
                                     mappings,

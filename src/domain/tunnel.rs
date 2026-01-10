@@ -121,6 +121,45 @@ pub enum TunnelMessage {
         request_id: String,
         error: String,
     },
+
+    // ========== 热切换 (Zero-Downtime Takeover) 消息 ==========
+
+    /// 接管请求 (新进程 Client -> Server)
+    ///
+    /// 新进程连接后发送此消息，请求接管旧进程的端口映射。
+    /// Server 会将端口监听器的绑定从旧连接切换到新连接。
+    Takeover {
+        /// 客户端 ID（与旧进程相同）
+        client_id: String,
+        /// 端口映射配置
+        mappings: Vec<PortMapping>,
+        /// 新进程的会话 ID
+        new_session_id: String,
+    },
+
+    /// 接管就绪 (Server -> 新进程 Client)
+    ///
+    /// Server 确认已将端口绑定切换到新连接，新进程可以开始工作。
+    TakeoverReady {
+        /// 确认的会话 ID
+        session_id: String,
+    },
+
+    /// 接管完成 (Server -> 旧进程 Client)
+    ///
+    /// 通知旧进程：新进程已接管，可以优雅退出。
+    TakeoverComplete {
+        /// 新进程的会话 ID
+        new_session_id: String,
+    },
+
+    /// 接管失败 (Server -> 新进程 Client)
+    ///
+    /// 接管失败，新进程应该退出，旧进程继续运行。
+    TakeoverFailed {
+        /// 错误信息
+        error: String,
+    },
 }
 
 /// 隧道连接信息 (用于 API 响应)

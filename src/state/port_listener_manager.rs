@@ -535,6 +535,81 @@ impl PortListenerManager {
             listener.shutdown();
         }
     }
+
+    /// 热切换：将指定客户端的所有端口绑定切换到新的 WebSocket 连接
+    ///
+    /// 用于零断线更新：新进程连接后接管旧进程的端口绑定，
+    /// 现有连接继续由旧的通道处理直到关闭，新连接使用新的通道。
+    ///
+    /// # Arguments
+    /// * `client_id` - 客户端 ID（新旧进程相同）
+    /// * `new_ws_tx` - 新进程的 WebSocket 发送通道
+    /// * `mappings` - 端口映射配置
+    ///
+    /// # Returns
+    /// * `Ok(switched_count)` - 成功切换的端口数量
+    /// * `Err(error)` - 如果有端口未找到
+    pub async fn switch_client_binding(
+        &self,
+        client_id: &str,
+        new_ws_tx: mpsc::Sender<TunnelMessage>,
+        mappings: &[PortMapping],
+    ) -> Result<usize, String> {
+        let listeners = self.listeners.read().await;
+        let mut switched = 0;
+
+        for mapping in mappings {
+            if let Some(listener) = listeners.get(&mapping.remote_port) {
+                // 只有当前绑定的是同一个 client_id 才切换
+                let current_client = listener.bound_client_id().await;
+                if current_client.as_deref() == Some(client_id) {
+                    // 原子切换到新的 WebSocket 连接
+                    listener
+                        .bind(client_id.to_string(), new_ws_tx.clone())
+                        .await;
+                    info!(
+                        port = mapping.remote_port,
+                        client_id = %client_id,
+                        "Switched port binding to new connection (takeover)"
+                    );
+                    switched += 1;
+                } else {
+                    warn!(
+                        port = mapping.remote_port,
+                        expected_client = %client_id,
+                        actual_client = ?current_client,
+                        "Port not bound to expected client, binding anyway"
+                    );
+                    // 即使不是当前客户端，也绑定（可能是首次连接或重连）
+                    listener
+                        .bind(client_id.to_string(), new_ws_tx.clone())
+                        .await;
+                    switched += 1;
+                }
+            } else {
+                // 端口监听器不存在，需要创建
+                warn!(
+                    port = mapping.remote_port,
+                    "Port listener not found during takeover, this shouldn't happen"
+                );
+            }
+        }
+
+        if switched == 0 && !mappings.is_empty() {
+            return Err("No ports were switched".to_string());
+        }
+
+        Ok(switched)
+    }
+
+    /// 检查客户端是否已绑定到指定端口
+    pub async fn is_client_bound(&self, client_id: &str, port: u16) -> bool {
+        if let Some(listener) = self.get_listener(port).await {
+            listener.bound_client_id().await.as_deref() == Some(client_id)
+        } else {
+            false
+        }
+    }
 }
 
 impl Default for PortListenerManager {

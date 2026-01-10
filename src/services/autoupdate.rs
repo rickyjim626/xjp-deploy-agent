@@ -202,8 +202,9 @@ async fn download_and_apply_update(
     tracing::info!("Update applied, restarting...");
 
     // Step 5: 重启进程
-    // 使用 exec 系统调用替换当前进程
-    restart_self(&current_binary).await?;
+    // 对于 TunnelMode::Client 使用 Takeover 模式（零断线更新）
+    // 对于其他模式使用传统重启
+    restart_self(state, &current_binary).await?;
 
     Ok(())
 }
@@ -348,16 +349,35 @@ async fn run_canary_health_check(binary_path: &PathBuf) -> bool {
 
 /// 重启当前进程
 ///
-/// 使用统一的 RestartManager 处理不同平台的重启逻辑
-/// 在退出前会触发优雅关闭，让 tunnel client 发送 WebSocket Close 帧
-async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// 对于 TunnelMode::Client，使用 Takeover 模式实现零断线更新：
+/// 1. 启动新进程（带 --takeover 参数）
+/// 2. 新进程连接服务端并发送 Takeover 请求
+/// 3. 服务端切换端口绑定到新进程
+/// 4. 服务端通知旧进程 TakeoverComplete
+/// 5. 旧进程收到消息后退出
+///
+/// 对于其他模式，使用传统的优雅关闭重启。
+async fn restart_self(
+    state: &Arc<AppState>,
+    binary_path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::domain::tunnel::TunnelMode;
     use crate::services::restart::{RestartManager, RestartMode};
     use crate::state::app_state::trigger_shutdown;
 
     tracing::info!(
         binary = %binary_path.display(),
-        "Restarting process via RestartManager"
+        tunnel_mode = ?state.tunnel_mode,
+        "Restarting process"
     );
+
+    // 对于 TunnelMode::Client，使用 Takeover 模式实现零断线更新
+    if state.tunnel_mode == TunnelMode::Client {
+        return restart_with_takeover(binary_path).await;
+    }
+
+    // 其他模式使用传统重启
+    tracing::info!("Using traditional restart (non-client mode)");
 
     // 检测运行模式
     #[cfg(windows)]
@@ -402,6 +422,119 @@ async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::E
 
     tracing::info!("Exiting for restart...");
     std::process::exit(0);
+}
+
+/// 使用 Takeover 模式重启（零断线更新）
+///
+/// 流程：
+/// 1. 生成唯一的 session ID
+/// 2. 启动新进程，带 --takeover <session_id> 参数
+/// 3. 新进程连接到服务端并发送 Takeover 请求
+/// 4. 服务端切换端口绑定到新进程的 WebSocket 连接
+/// 5. 服务端向旧进程发送 TakeoverComplete 消息
+/// 6. 旧进程的 tunnel client 收到 TakeoverComplete 后调用 exit(0)
+///
+/// 本函数不会主动退出，而是等待 TakeoverComplete 触发退出
+async fn restart_with_takeover(
+    binary_path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 生成唯一的 session ID
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    tracing::info!(
+        binary = %binary_path.display(),
+        session_id = %session_id,
+        "Starting takeover restart (zero-downtime)"
+    );
+
+    // 启动新进程，带 --takeover 参数
+    let child = Command::new(binary_path)
+        .args(["--takeover", &session_id])
+        .stdout(Stdio::inherit())  // 继承 stdout 以便查看日志
+        .stderr(Stdio::inherit())  // 继承 stderr 以便查看错误
+        .spawn();
+
+    match child {
+        Ok(mut child) => {
+            tracing::info!(
+                session_id = %session_id,
+                pid = ?child.id(),
+                "New process spawned, waiting for takeover"
+            );
+
+            // 等待一小段时间让新进程启动
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // 检查新进程是否还在运行
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // 新进程已退出，说明启动失败
+                    tracing::error!(
+                        exit_code = ?status.code(),
+                        "New process exited prematurely, takeover failed"
+                    );
+                    return Err("New process exited prematurely".into());
+                }
+                Ok(None) => {
+                    // 新进程还在运行，继续等待 TakeoverComplete
+                    tracing::info!(
+                        session_id = %session_id,
+                        "New process is running, waiting for TakeoverComplete from server"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to check new process status");
+                    return Err(format!("Failed to check new process: {}", e).into());
+                }
+            }
+
+            // 此时新进程应该正在连接服务端并发送 Takeover 请求
+            // 服务端会向本进程发送 TakeoverComplete 消息
+            // tunnel client 收到后会调用 exit(0)
+            //
+            // 我们在这里等待最多 30 秒，如果还没收到 TakeoverComplete，
+            // 说明可能出了问题，但我们不主动退出，让进程继续运行
+            tracing::info!(
+                "Takeover initiated. Old process will exit when TakeoverComplete is received. \
+                 If takeover fails, this process will continue running."
+            );
+
+            // 等待 30 秒（给 TakeoverComplete 足够的时间到达）
+            // 如果 30 秒后还没退出，说明 TakeoverComplete 没收到
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            // 如果执行到这里，说明 30 秒内没有收到 TakeoverComplete
+            // 可能是新进程连接失败，或者服务端没有发送消息
+            // 检查新进程状态
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::warn!(
+                        exit_code = ?status.code(),
+                        "New process has exited. Takeover may have failed. Old process continues."
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "30 seconds passed without TakeoverComplete. \
+                         New process is still running. Both processes may be active now. \
+                         Old process will continue running."
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to check new process status after timeout");
+                }
+            }
+
+            // 不主动退出，让进程继续运行
+            // 如果新进程成功接管，服务端会发送 TakeoverComplete，
+            // tunnel client 会在收到时调用 exit(0)
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to spawn new process for takeover");
+            Err(format!("Failed to spawn new process: {}", e).into())
+        }
+    }
 }
 
 // Note: Windows restart functions have been moved to services::restart::RestartManager
