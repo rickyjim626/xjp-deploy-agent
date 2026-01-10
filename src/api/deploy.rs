@@ -24,6 +24,7 @@ use crate::domain::deploy::DeployTask;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::RequireApiKey;
 use crate::services;
+use crate::services::queue_persistence::PersistedTask;
 use crate::state::app_state::QueuedDeploy;
 use crate::state::AppState;
 
@@ -148,17 +149,36 @@ async fn trigger_deploy(
         state.task_store.create(task).await;
 
         // 加入队列
+        let queued_at = Utc::now();
         let position = state
             .enqueue_deploy(
                 &project,
                 QueuedDeploy {
                     task_id: task_id.clone(),
                     project_config,
-                    request,
-                    queued_at: Utc::now(),
+                    request: request.clone(),
+                    queued_at,
                 },
             )
             .await;
+
+        // 持久化队列任务
+        if let Err(e) = state
+            .queue_persistence
+            .add_task(PersistedTask {
+                task_id: task_id.clone(),
+                project: project.clone(),
+                deploy_log_id: request.deploy_log_id,
+                commit_hash: request.commit_hash,
+                branch: request.branch,
+                status: "queued".to_string(),
+                queued_at,
+                started_at: None,
+            })
+            .await
+        {
+            tracing::error!(error = %e, "Failed to persist queued task");
+        }
 
         tracing::info!(
             task_id = %task_id,
@@ -187,6 +207,25 @@ async fn trigger_deploy(
 
     // 注册运行中的部署
     let _cancel_token = state.register_running_deploy(&project, &task_id).await;
+
+    // 持久化运行中的任务
+    let started_at = Utc::now();
+    if let Err(e) = state
+        .queue_persistence
+        .add_task(PersistedTask {
+            task_id: task_id.clone(),
+            project: project.clone(),
+            deploy_log_id: request.deploy_log_id.clone(),
+            commit_hash: request.commit_hash.clone(),
+            branch: request.branch.clone(),
+            status: "running".to_string(),
+            queued_at: started_at,
+            started_at: Some(started_at),
+        })
+        .await
+    {
+        tracing::error!(error = %e, "Failed to persist running task");
+    }
 
     // 构建响应数据
     let response = TriggerResponse {

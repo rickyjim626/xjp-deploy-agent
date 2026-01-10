@@ -38,6 +38,7 @@ use crate::services::{
     ssh::SshServer,
     lan_discovery::{LanDiscovery, LanDiscoveryConfig},
     service_router::{ServiceRouter, ServiceRouterConfig},
+    queue_persistence::QueuePersistence,
 };
 
 use super::log_hub::LogHub;
@@ -128,6 +129,10 @@ pub struct AppState {
     // ========== Service Router ==========
     /// 服务路由器（智能选择最优端点）
     pub service_router: Option<Arc<ServiceRouter>>,
+
+    // ========== Queue Persistence ==========
+    /// 队列持久化（用于重启恢复）
+    pub queue_persistence: Arc<QueuePersistence>,
 }
 
 impl AppState {
@@ -231,6 +236,8 @@ impl AppState {
             mesh_client,
             lan_discovery,
             service_router,
+
+            queue_persistence: Arc::new(QueuePersistence::new()),
 
             config,
         }

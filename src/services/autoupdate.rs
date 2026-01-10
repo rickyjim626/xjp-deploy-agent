@@ -107,25 +107,125 @@ async fn check_and_apply_update(
     tracing::info!(
         current = VERSION,
         latest = %metadata.version,
-        "Update available, starting blue-green deployment"
+        "Update available, checking if safe to apply"
+    );
+
+    // 检查是否有任务正在运行
+    let running_deploys = state.running_deploys.read().await;
+    if !running_deploys.is_empty() {
+        let running_projects: Vec<_> = running_deploys.keys().cloned().collect();
+        drop(running_deploys);
+
+        // 延迟更新：设置 pending_update，等待任务完成后自动触发
+        tracing::info!(
+            running_projects = ?running_projects,
+            version = %metadata.version,
+            "Deferring update: tasks are running. Will apply after completion."
+        );
+
+        state.auto_update_state.set_pending_update(Some(metadata.clone())).await;
+        *state.auto_update_state.update_progress.write().await = "deferred".to_string();
+        *state.auto_update_state.last_check_result.write().await =
+            Some(format!("Update to {} deferred - waiting for {} running task(s)",
+                metadata.version, running_projects.len()));
+
+        return Ok(());
+    }
+    drop(running_deploys);
+
+    // 没有运行中的任务，执行更新
+    apply_update_internal(state, config, &metadata).await
+}
+
+/// 内部更新执行函数（供正常更新和延迟更新使用）
+async fn apply_update_internal(
+    state: &Arc<AppState>,
+    config: &AutoUpdateConfig,
+    metadata: &UpdateMetadata,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 设置更新进行中标志，阻止新任务入队
+    state.auto_update_state.set_update_in_progress(true).await;
+
+    tracing::info!(
+        current = VERSION,
+        latest = %metadata.version,
+        "Starting blue-green deployment"
     );
 
     // 执行蓝绿部署更新
-    match download_and_apply_update(state, config, &metadata).await {
+    match download_and_apply_update(state, config, metadata).await {
         Ok(()) => {
             *state.auto_update_state.last_check_result.write().await =
                 Some(format!("Successfully updated to {}", metadata.version));
             tracing::info!(version = %metadata.version, "Update applied successfully");
+            // 清除 pending_update
+            state.auto_update_state.set_pending_update(None).await;
         }
         Err(e) => {
             *state.auto_update_state.last_check_result.write().await =
                 Some(format!("Update failed: {}", e));
             tracing::error!(error = %e, "Failed to apply update");
+            // 重置状态
+            state.auto_update_state.set_update_in_progress(false).await;
+            state.auto_update_state.set_pending_update(None).await;
+            *state.auto_update_state.update_progress.write().await = "none".to_string();
             return Err(e);
         }
     }
 
     Ok(())
+}
+
+/// 触发待执行的更新（由任务完成时调用）
+pub async fn trigger_pending_update(state: Arc<AppState>) {
+    let config = match &state.auto_update_config {
+        Some(config) => config.clone(),
+        None => {
+            tracing::warn!("Cannot trigger pending update: auto-update not configured");
+            return;
+        }
+    };
+
+    let metadata = match state.auto_update_state.get_pending_update().await {
+        Some(m) => m,
+        None => {
+            tracing::debug!("No pending update to trigger");
+            return;
+        }
+    };
+
+    // 再次检查是否有任务运行（防止竞态条件）
+    let running_deploys = state.running_deploys.read().await;
+    if !running_deploys.is_empty() {
+        tracing::info!(
+            running = running_deploys.len(),
+            "Pending update still waiting: tasks still running"
+        );
+        return;
+    }
+    drop(running_deploys);
+
+    // 也检查队列是否为空
+    let deploy_queue = state.deploy_queue.read().await;
+    let total_queued: usize = deploy_queue.values().map(|q| q.len()).sum();
+    if total_queued > 0 {
+        tracing::info!(
+            queued = total_queued,
+            "Pending update still waiting: tasks in queue"
+        );
+        return;
+    }
+    drop(deploy_queue);
+
+    tracing::info!(
+        version = %metadata.version,
+        "All tasks complete, triggering deferred update"
+    );
+
+    // 执行更新
+    if let Err(e) = apply_update_internal(&state, &config, &metadata).await {
+        tracing::error!(error = %e, "Failed to apply deferred update");
+    }
 }
 
 /// 下载并应用更新 (蓝绿部署策略)

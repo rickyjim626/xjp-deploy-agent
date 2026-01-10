@@ -13,6 +13,7 @@ pub mod log_reporter;
 pub mod restart;
 pub mod lan_discovery;
 pub mod service_router;
+pub mod queue_persistence;
 
 #[cfg(windows)]
 pub mod windows_service;

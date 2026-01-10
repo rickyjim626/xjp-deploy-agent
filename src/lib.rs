@@ -122,6 +122,9 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
         "Configuration loaded"
     );
 
+    // 2.5 恢复持久化的任务队列
+    recover_persisted_tasks(state.clone()).await;
+
     // 3. 启动后台任务
     // 3.1 NFA supervisor (Windows 节点)
     if let Some(nfa) = &state.nfa {
@@ -292,4 +295,139 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
     axum::serve(listener, app)
         .await
         .expect("Server error");
+}
+
+/// 恢复持久化的任务队列
+///
+/// 在 Agent 重启后，从持久化文件恢复之前的队列和运行中的任务
+async fn recover_persisted_tasks(state: Arc<AppState>) {
+    use crate::api::deploy::TriggerRequest;
+    use crate::domain::deploy::DeployTask;
+    use crate::state::app_state::QueuedDeploy;
+
+    // 加载持久化的队列
+    let Some(persisted) = state.queue_persistence.load().await else {
+        tracing::debug!("No persisted queue found");
+        return;
+    };
+
+    if persisted.tasks.is_empty() {
+        tracing::debug!("Persisted queue is empty");
+        return;
+    }
+
+    tracing::info!(
+        tasks = persisted.tasks.len(),
+        saved_at = %persisted.saved_at,
+        "Recovering persisted tasks"
+    );
+
+    let mut recovered_queued = 0;
+    let mut recovered_running = 0;
+    let mut skipped = 0;
+
+    for task in persisted.tasks {
+        // 检查项目是否仍然存在
+        let project_config = if let Some(config) = state.get_project(&task.project) {
+            config.clone()
+        } else {
+            // 尝试从部署中心获取
+            match state.deploy_center.fetch_config(&task.project).await {
+                Some(remote) => match remote.to_project_config() {
+                    Some(config) => config,
+                    None => {
+                        tracing::warn!(
+                            task_id = %task.task_id,
+                            project = %task.project,
+                            "Cannot recover task: project config invalid"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        task_id = %task.task_id,
+                        project = %task.project,
+                        "Cannot recover task: project not found"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        };
+
+        // 创建任务记录
+        let deploy_task = if task.status == "running" {
+            DeployTask::new(task.task_id.clone(), task.project.clone())
+        } else {
+            DeployTask::new_queued(task.task_id.clone(), task.project.clone())
+        };
+        state.task_store.create(deploy_task).await;
+
+        // 根据状态恢复
+        if task.status == "running" {
+            // 运行中的任务：重新执行（从头开始）
+            // 创建日志通道
+            state.log_hub.create(&task.task_id).await;
+
+            // 注册运行中的部署
+            let _cancel_token = state
+                .register_running_deploy(&task.project, &task.task_id)
+                .await;
+
+            // 在后台重新执行
+            let state_clone = state.clone();
+            let task_id = task.task_id.clone();
+            let project = task.project.clone();
+            let request = TriggerRequest {
+                deploy_log_id: task.deploy_log_id,
+                commit_hash: task.commit_hash,
+                branch: task.branch,
+            };
+            tokio::spawn(async move {
+                services::deploy::execute(state_clone, task_id, project, project_config, request)
+                    .await;
+            });
+
+            tracing::info!(
+                task_id = %task.task_id,
+                project = %task.project,
+                "Recovered running task (will restart from beginning)"
+            );
+            recovered_running += 1;
+        } else {
+            // 排队中的任务：加入队列
+            let request = TriggerRequest {
+                deploy_log_id: task.deploy_log_id,
+                commit_hash: task.commit_hash,
+                branch: task.branch,
+            };
+            state
+                .enqueue_deploy(
+                    &task.project,
+                    QueuedDeploy {
+                        task_id: task.task_id.clone(),
+                        project_config,
+                        request,
+                        queued_at: task.queued_at,
+                    },
+                )
+                .await;
+
+            tracing::info!(
+                task_id = %task.task_id,
+                project = %task.project,
+                "Recovered queued task"
+            );
+            recovered_queued += 1;
+        }
+    }
+
+    tracing::info!(
+        recovered_running = recovered_running,
+        recovered_queued = recovered_queued,
+        skipped = skipped,
+        "Task recovery complete"
+    );
 }

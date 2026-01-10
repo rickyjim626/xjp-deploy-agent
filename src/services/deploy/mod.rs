@@ -142,6 +142,11 @@ async fn execute_single(
     heartbeat_task.abort();
     timeout_task.abort();
 
+    // 从持久化中移除任务
+    if let Err(e) = state.queue_persistence.remove_task(&task_id).await {
+        tracing::error!(task_id = %task_id, error = %e, "Failed to remove task from persistence");
+    }
+
     // 取消注册当前部署
     state.unregister_running_deploy(&project).await;
 }
@@ -168,6 +173,16 @@ async fn process_queue(state: Arc<AppState>, project: String) {
             .update_status(&next.task_id, DeployStatus::Running, None)
             .await;
 
+        // 更新持久化状态为 running
+        let started_at = chrono::Utc::now();
+        if let Err(e) = state
+            .queue_persistence
+            .update_task_status(&next.task_id, "running", Some(started_at))
+            .await
+        {
+            tracing::error!(task_id = %next.task_id, error = %e, "Failed to update task status in persistence");
+        }
+
         // 注册新的运行中部署
         let _cancel_token = state.register_running_deploy(&project, &next.task_id).await;
 
@@ -184,6 +199,50 @@ async fn process_queue(state: Arc<AppState>, project: String) {
         )
         .await;
     }
+
+    // 队列处理完毕，检查是否有待执行的更新
+    check_and_trigger_pending_update(state).await;
+}
+
+/// 检查并触发待执行的更新
+async fn check_and_trigger_pending_update(state: Arc<AppState>) {
+    // 检查是否有待执行的更新
+    if !state.auto_update_state.has_pending_update().await {
+        return;
+    }
+
+    // 检查是否所有项目都没有运行中的任务
+    let running_deploys = state.running_deploys.read().await;
+    if !running_deploys.is_empty() {
+        tracing::debug!(
+            running = running_deploys.len(),
+            "Pending update waiting: other projects still have running tasks"
+        );
+        return;
+    }
+    drop(running_deploys);
+
+    // 检查所有队列是否都为空
+    let deploy_queue = state.deploy_queue.read().await;
+    let total_queued: usize = deploy_queue.values().map(|q| q.len()).sum();
+    if total_queued > 0 {
+        tracing::debug!(
+            queued = total_queued,
+            "Pending update waiting: tasks still in queue"
+        );
+        return;
+    }
+    drop(deploy_queue);
+
+    tracing::info!("All tasks complete, triggering pending update");
+
+    // 在后台任务中触发更新（避免阻塞当前任务）
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        // 短暂延迟，确保所有清理工作完成
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        super::autoupdate::trigger_pending_update(state_clone).await;
+    });
 }
 
 /// 启动心跳任务

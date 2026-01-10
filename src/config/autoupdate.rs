@@ -79,10 +79,14 @@ pub struct AutoUpdateState {
     pub latest_version: RwLock<Option<String>>,
     /// 是否有可用更新
     pub update_available: RwLock<bool>,
-    /// 更新进度 (downloading, verifying, applying, none)
+    /// 更新进度 (downloading, verifying, applying, deferred, none)
     pub update_progress: RwLock<String>,
     /// 下一次检查时间
     pub next_check: RwLock<Option<DateTime<Utc>>>,
+    /// 待执行的更新（当有任务运行时延迟更新）
+    pub pending_update: RwLock<Option<UpdateMetadata>>,
+    /// 是否正在执行更新（阻止新任务入队）
+    pub update_in_progress: RwLock<bool>,
 }
 
 impl AutoUpdateState {
@@ -94,7 +98,34 @@ impl AutoUpdateState {
             update_available: RwLock::new(false),
             update_progress: RwLock::new("none".to_string()),
             next_check: RwLock::new(None),
+            pending_update: RwLock::new(None),
+            update_in_progress: RwLock::new(false),
         }
+    }
+
+    /// 设置待执行的更新
+    pub async fn set_pending_update(&self, metadata: Option<UpdateMetadata>) {
+        *self.pending_update.write().await = metadata;
+    }
+
+    /// 获取待执行的更新
+    pub async fn get_pending_update(&self) -> Option<UpdateMetadata> {
+        self.pending_update.read().await.clone()
+    }
+
+    /// 检查是否有待执行的更新
+    pub async fn has_pending_update(&self) -> bool {
+        self.pending_update.read().await.is_some()
+    }
+
+    /// 设置更新进行中状态
+    pub async fn set_update_in_progress(&self, in_progress: bool) {
+        *self.update_in_progress.write().await = in_progress;
+    }
+
+    /// 检查是否正在更新
+    pub async fn is_update_in_progress(&self) -> bool {
+        *self.update_in_progress.read().await
     }
 }
 
