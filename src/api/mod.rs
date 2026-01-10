@@ -9,6 +9,7 @@ pub mod deploy;
 pub mod database;
 pub mod tunnel;
 pub mod nfa;
+pub mod lan;
 
 use axum::Router;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(tunnel::router())
         // NFA
         .merge(nfa::router())
+        // LAN Discovery & Service Router
+        .nest("/lan", lan::router())
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

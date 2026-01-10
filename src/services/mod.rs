@@ -11,6 +11,8 @@ pub mod ssh;
 pub mod tunnel;
 pub mod log_reporter;
 pub mod restart;
+pub mod lan_discovery;
+pub mod service_router;
 
 #[cfg(windows)]
 pub mod windows_service;

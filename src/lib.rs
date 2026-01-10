@@ -215,6 +215,16 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
         });
     }
 
+    // 3.3.1 LAN 发现服务 (如果启用)
+    if let Some(ref lan_discovery) = state.lan_discovery {
+        let discovery_clone = lan_discovery.clone();
+        tokio::spawn(async move {
+            if let Err(e) = discovery_clone.start().await {
+                tracing::warn!(error = %e, "Failed to start LAN discovery");
+            }
+        });
+    }
+
     // 3.4 自动更新 (如果启用)
     if state.auto_update_config.is_some() {
         let state_clone = state.clone();

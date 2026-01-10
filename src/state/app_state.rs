@@ -31,7 +31,14 @@ use crate::config::{
 };
 use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::infra::DeployCenterClient;
-use crate::services::{frp::FrpcManager, mesh::MeshClient, nfa::NfaSupervisor, ssh::SshServer};
+use crate::services::{
+    frp::FrpcManager,
+    mesh::MeshClient,
+    nfa::NfaSupervisor,
+    ssh::SshServer,
+    lan_discovery::{LanDiscovery, LanDiscoveryConfig},
+    service_router::{ServiceRouter, ServiceRouterConfig},
+};
 
 use super::log_hub::LogHub;
 use super::port_listener_manager::PortListenerManager;
@@ -113,6 +120,14 @@ pub struct AppState {
     // ========== Service Mesh ==========
     /// Mesh 客户端（用于服务发现和端点解析）
     pub mesh_client: Option<Arc<MeshClient>>,
+
+    // ========== LAN Discovery ==========
+    /// LAN 发现服务（用于自动发现同网段的 Agent）
+    pub lan_discovery: Option<Arc<LanDiscovery>>,
+
+    // ========== Service Router ==========
+    /// 服务路由器（智能选择最优端点）
+    pub service_router: Option<Arc<ServiceRouter>>,
 }
 
 impl AppState {
@@ -166,6 +181,25 @@ impl AppState {
             Arc::new(MeshClient::new(mesh_config))
         });
 
+        // 初始化 LAN 发现服务（如果配置了）
+        let lan_discovery = LanDiscoveryConfig::from_env().map(|lan_config| {
+            tracing::info!(
+                agent_id = %lan_config.agent_id,
+                broadcast_port = lan_config.broadcast_port,
+                local_services = lan_config.local_services.len(),
+                "LAN discovery configured"
+            );
+            Arc::new(LanDiscovery::new(lan_config))
+        });
+
+        // 初始化服务路由器
+        let router_config = ServiceRouterConfig::from_env();
+        let service_router = Some(Arc::new(ServiceRouter::new(
+            router_config,
+            lan_discovery.clone(),
+            mesh_client.clone(),
+        )));
+
         Self {
             api_key: config.api_key.clone(),
             projects,
@@ -195,6 +229,8 @@ impl AppState {
             auto_update_state: Arc::new(AutoUpdateState::new()),
 
             mesh_client,
+            lan_discovery,
+            service_router,
 
             config,
         }
