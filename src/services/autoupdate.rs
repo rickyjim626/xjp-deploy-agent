@@ -472,7 +472,22 @@ async fn restart_self(
     );
 
     // 对于 TunnelMode::Client，使用 Takeover 模式实现零断线更新
-    if state.tunnel_mode == TunnelMode::Client {
+    // 但 Windows 服务模式例外：使用服务恢复机制更可靠
+    #[cfg(windows)]
+    let use_takeover = {
+        use crate::services::windows_service;
+        if windows_service::is_running_as_service() {
+            tracing::info!("Windows service mode: using service recovery instead of takeover");
+            false
+        } else {
+            state.tunnel_mode == TunnelMode::Client
+        }
+    };
+
+    #[cfg(not(windows))]
+    let use_takeover = state.tunnel_mode == TunnelMode::Client;
+
+    if use_takeover {
         return restart_with_takeover(binary_path).await;
     }
 
@@ -608,27 +623,29 @@ async fn restart_with_takeover(
             // 检查新进程状态
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    // 新进程已退出，说明 takeover 失败
                     tracing::warn!(
                         exit_code = ?status.code(),
-                        "New process has exited. Takeover may have failed. Old process continues."
+                        "New process has exited. Takeover failed. Old process continues."
                     );
+                    // 新进程挂了，旧进程继续运行
+                    return Ok(());
                 }
                 Ok(None) => {
-                    tracing::warn!(
-                        "30 seconds passed without TakeoverComplete. \
-                         New process is still running. Both processes may be active now. \
-                         Old process will continue running."
+                    // 新进程还在运行，说明 takeover 可能成功了
+                    // 旧进程应该退出，避免僵尸进程
+                    tracing::info!(
+                        "30 seconds passed, new process is still running. \
+                         Assuming takeover succeeded. Exiting old process."
                     );
+                    std::process::exit(0);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to check new process status after timeout");
+                    // 无法确定状态，保守起见退出
+                    std::process::exit(0);
                 }
             }
-
-            // 不主动退出，让进程继续运行
-            // 如果新进程成功接管，服务端会发送 TakeoverComplete，
-            // tunnel client 会在收到时调用 exit(0)
-            Ok(())
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to spawn new process for takeover");
