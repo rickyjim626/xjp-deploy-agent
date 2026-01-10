@@ -305,8 +305,11 @@ impl LanDiscovery {
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, src)) => {
+                    debug!(len = len, src = %src, "Received UDP packet");
+
                     // 快速检查魔数
                     if len < 4 || &buf[..4] != BROADCAST_MAGIC {
+                        debug!(len = len, src = %src, magic = ?&buf[..4.min(len)], "Invalid magic bytes, ignoring");
                         continue;
                     }
 
@@ -315,14 +318,22 @@ impl LanDiscovery {
                         Ok(packet) => {
                             // 忽略自己的广播
                             if packet.agent_id == self.config.agent_id {
+                                debug!(agent_id = %packet.agent_id, "Ignoring own broadcast");
                                 continue;
                             }
+
+                            info!(
+                                src = %src,
+                                agent_id = %packet.agent_id,
+                                services = packet.services.len(),
+                                "Received discovery packet from peer"
+                            );
 
                             // 处理发现的 peer
                             self.handle_discovery(packet, src).await;
                         }
                         Err(e) => {
-                            debug!(error = %e, src = %src, "Failed to deserialize discovery packet");
+                            warn!(error = %e, src = %src, len = len, "Failed to deserialize discovery packet");
                         }
                     }
                 }
