@@ -95,10 +95,12 @@ pub async fn start(state: Arc<AppState>, shutdown_token: CancellationToken) {
                 break;
             }
             Ok(ClientResult::TakeoverComplete) => {
-                info!("Tunnel client received takeover complete, new process has taken over, exiting");
-                // 新进程已接管，旧进程应该退出
-                // 注意：这里不 break，而是直接退出进程
-                // 因为自动更新场景下，新进程已经在运行了
+                info!("Tunnel client received takeover complete, new process has taken over");
+                // 新进程已接管端口绑定
+                // 服务端已经清理了旧的活跃连接，我们可以安全退出
+                // 短暂等待确保旧连接的 TCP RST 发送完成
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                info!("Exiting old process");
                 std::process::exit(0);
             }
             Ok(result) => {

@@ -395,6 +395,23 @@ impl PortListener {
         self.active_connections.read().await.len()
     }
 
+    /// 清理所有活跃连接
+    ///
+    /// 用于 Takeover 时清理旧连接，因为新进程无法处理旧的 conn_id。
+    /// 这会导致正在进行的请求中断，客户端需要重试。
+    pub async fn clear_all_connections(&self) {
+        let mut conns = self.active_connections.write().await;
+        let count = conns.len();
+        conns.clear();
+
+        let mut pending = self.pending_connections.write().await;
+        pending.clear();
+
+        if count > 0 {
+            info!(port = self.port, cleared = count, "Cleared all active connections for takeover");
+        }
+    }
+
     /// 检查是否已启动
     pub async fn is_started(&self) -> bool {
         *self.started.read().await
@@ -538,8 +555,11 @@ impl PortListenerManager {
 
     /// 热切换：将指定客户端的所有端口绑定切换到新的 WebSocket 连接
     ///
-    /// 用于零断线更新：新进程连接后接管旧进程的端口绑定，
-    /// 现有连接继续由旧的通道处理直到关闭，新连接使用新的通道。
+    /// 用于零断线更新：新进程连接后接管旧进程的端口绑定。
+    ///
+    /// **注意**：切换后，现有活跃连接会被清理（因为新进程没有对应的本地连接）。
+    /// 这意味着正在进行的请求会中断，但新请求会无缝使用新进程。
+    /// 对于大多数短连接场景（HTTP API），这通常不是问题。
     ///
     /// # Arguments
     /// * `client_id` - 客户端 ID（新旧进程相同）
@@ -557,12 +577,26 @@ impl PortListenerManager {
     ) -> Result<usize, String> {
         let listeners = self.listeners.read().await;
         let mut switched = 0;
+        let mut total_active_conns = 0;
 
         for mapping in mappings {
             if let Some(listener) = listeners.get(&mapping.remote_port) {
                 // 只有当前绑定的是同一个 client_id 才切换
                 let current_client = listener.bound_client_id().await;
+                let active_conns = listener.active_connection_count().await;
+                total_active_conns += active_conns;
+
                 if current_client.as_deref() == Some(client_id) {
+                    // 先清理所有活跃连接（因为新进程无法处理旧连接）
+                    if active_conns > 0 {
+                        info!(
+                            port = mapping.remote_port,
+                            active_connections = active_conns,
+                            "Clearing active connections before takeover"
+                        );
+                        listener.clear_all_connections().await;
+                    }
+
                     // 原子切换到新的 WebSocket 连接
                     listener
                         .bind(client_id.to_string(), new_ws_tx.clone())
@@ -593,6 +627,14 @@ impl PortListenerManager {
                     "Port listener not found during takeover, this shouldn't happen"
                 );
             }
+        }
+
+        if total_active_conns > 0 {
+            warn!(
+                total_active_connections = total_active_conns,
+                "Active connections were cleared during takeover. \
+                 These connections will be reset and clients should retry."
+            );
         }
 
         if switched == 0 && !mappings.is_empty() {
