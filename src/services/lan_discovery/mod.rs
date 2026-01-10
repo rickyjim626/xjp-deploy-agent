@@ -252,9 +252,25 @@ impl LanDiscovery {
 
     /// 广播循环
     async fn broadcast_loop(&self, socket: Arc<UdpSocket>) {
+        // 计算子网广播地址（假设 /24 网络）
+        // 例如: 192.168.1.4 -> 192.168.1.255
+        let broadcast_ip = self.local_ip.as_ref()
+            .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+            .map(|ip| {
+                let octets = ip.octets();
+                Ipv4Addr::new(octets[0], octets[1], octets[2], 255)
+            })
+            .unwrap_or(Ipv4Addr::BROADCAST);
+
         let broadcast_addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(broadcast_ip),
             self.config.broadcast_port,
+        );
+
+        info!(
+            broadcast_addr = %broadcast_addr,
+            local_ip = ?self.local_ip,
+            "Using subnet broadcast address"
         );
 
         loop {
