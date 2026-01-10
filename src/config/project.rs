@@ -42,7 +42,7 @@ pub struct RemoteAgentConfig {
     pub compose_file: Option<String>,
     /// Service name to restart (for docker_compose type)
     pub services: Option<Vec<String>>,
-    /// Health check port for docker_compose canary (default 8081, BFF uses 3001)
+    /// Health check port for docker_compose canary (default 3000 for monolith, BFF uses 3001)
     pub health_port: Option<u16>,
     /// Environment variables
     pub env: Option<HashMap<String, String>>,

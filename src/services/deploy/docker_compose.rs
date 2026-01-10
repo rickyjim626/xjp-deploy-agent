@@ -242,8 +242,8 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
         ctx.log_stdout("[3/4] Running canary health check...").await;
 
         // Run canary health check using docker-compose to inherit env vars
-        // Default health port is 8081 (backend), BFF uses 3001
-        let health_port = config.health_port.unwrap_or(8081);
+        // Default health port is 3000 (monolith), BFF uses 3001
+        let health_port = config.health_port.unwrap_or(3000);
         let canary_result = run_canary_health_check(
             ctx,
             &config.image,
