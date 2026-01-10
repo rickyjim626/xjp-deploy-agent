@@ -162,12 +162,27 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
     // 3.2.1 WebSocket 隧道客户端
     if state.tunnel_mode == TunnelMode::Client {
         let state_clone = state.clone();
+        let shutdown_token = state::app_state::get_shutdown_token();
         tokio::spawn(async move {
-            services::tunnel::client::start(state_clone).await;
+            services::tunnel::client::start(state_clone, shutdown_token).await;
         });
     }
 
-    // 3.3 自动更新 (如果启用)
+    // 3.3 Service Mesh 客户端 (如果启用)
+    if let Some(ref mesh_client) = state.mesh_client {
+        let mesh_clone = mesh_client.clone();
+        tokio::spawn(async move {
+            // 启动 Mesh 客户端（注册 Agent）
+            if let Err(e) = mesh_clone.start().await {
+                tracing::warn!(error = %e, "Failed to start mesh client, continuing without mesh");
+            } else {
+                // 注册成功后启动心跳
+                mesh_clone.start_heartbeat();
+            }
+        });
+    }
+
+    // 3.4 自动更新 (如果启用)
     if state.auto_update_config.is_some() {
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -175,7 +190,7 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
         });
     }
 
-    // 3.4 日志上报服务 (上报 journalctl 日志到 Deploy Center，用于离线查看)
+    // 3.5 日志上报服务 (上报 journalctl 日志到 Deploy Center，用于离线查看)
     {
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -183,7 +198,7 @@ pub async fn run_agent_with_config(runtime_config: RuntimeConfig) {
         });
     }
 
-    // 3.5 定期清理任务
+    // 3.6 定期清理任务
     {
         let state_clone = state.clone();
         tokio::spawn(async move {

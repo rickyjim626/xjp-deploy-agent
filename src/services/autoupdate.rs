@@ -134,7 +134,8 @@ async fn download_and_apply_update(
     config: &AutoUpdateConfig,
     metadata: &UpdateMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let binary_url = config.binary_url(&metadata.version);
+    // 尝试通过 Mesh 解析 RustFS 端点，获取最佳下载地址（优先内网）
+    let binary_url = resolve_binary_url(state, config, &metadata.version).await;
 
     // Step 1: 下载新二进制
     *state.auto_update_state.update_progress.write().await = "downloading".to_string();
@@ -348,8 +349,10 @@ async fn run_canary_health_check(binary_path: &PathBuf) -> bool {
 /// 重启当前进程
 ///
 /// 使用统一的 RestartManager 处理不同平台的重启逻辑
+/// 在退出前会触发优雅关闭，让 tunnel client 发送 WebSocket Close 帧
 async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::restart::{RestartManager, RestartMode};
+    use crate::state::app_state::trigger_shutdown;
 
     tracing::info!(
         binary = %binary_path.display(),
@@ -389,8 +392,13 @@ async fn restart_self(binary_path: &PathBuf) -> Result<(), Box<dyn std::error::E
         .await
         .map_err(|e| format!("Failed to schedule restart: {}", e))?;
 
-    // 给重启调度一点时间启动
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // 触发优雅关闭，通知 tunnel client 发送 WebSocket Close 帧
+    tracing::info!("Triggering graceful shutdown for tunnel client...");
+    trigger_shutdown();
+
+    // 等待 tunnel client 优雅关闭 (发送 Close 帧)
+    // 500ms 足够发送 Close 帧并等待服务端确认
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     tracing::info!("Exiting for restart...");
     std::process::exit(0);
@@ -405,6 +413,43 @@ async fn fetch_update_metadata(
     let response = reqwest::get(url).await?;
     let metadata: UpdateMetadata = response.json().await?;
     Ok(metadata)
+}
+
+/// 通过 Mesh 解析最佳二进制下载 URL
+///
+/// 如果 Mesh 客户端可用且能解析 "rustfs" 服务，则使用解析到的端点 URL（可能是内网地址）；
+/// 否则使用配置中的默认端点 URL。
+async fn resolve_binary_url(state: &Arc<AppState>, config: &AutoUpdateConfig, version: &str) -> String {
+    // 构建二进制路径（不包含端点）
+    let binary_path = config.binary_path_template.replace("{version}", version);
+
+    // 尝试通过 Mesh 解析 RustFS 服务端点
+    if let Some(ref mesh_client) = state.mesh_client {
+        if mesh_client.is_enabled() {
+            match mesh_client.get_service_url("rustfs").await {
+                Ok(endpoint_url) => {
+                    let resolved_url = format!("{}/{}", endpoint_url.trim_end_matches('/'), binary_path);
+                    tracing::info!(
+                        original_endpoint = %config.endpoint,
+                        resolved_endpoint = %endpoint_url,
+                        resolved_url = %resolved_url,
+                        "Resolved RustFS endpoint via Mesh (using LAN if available)"
+                    );
+                    return resolved_url;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        fallback_endpoint = %config.endpoint,
+                        "Failed to resolve RustFS via Mesh, using fallback"
+                    );
+                }
+            }
+        }
+    }
+
+    // Fallback: 使用配置中的默认端点
+    config.binary_url(version)
 }
 
 /// 比较版本号

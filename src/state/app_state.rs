@@ -6,6 +6,23 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+/// 全局 shutdown token，用于优雅关闭所有后台任务
+static GLOBAL_SHUTDOWN: std::sync::OnceLock<CancellationToken> = std::sync::OnceLock::new();
+
+/// 获取全局 shutdown token
+pub fn get_shutdown_token() -> CancellationToken {
+    GLOBAL_SHUTDOWN
+        .get_or_init(CancellationToken::new)
+        .clone()
+}
+
+/// 触发全局 shutdown
+pub fn trigger_shutdown() {
+    if let Some(token) = GLOBAL_SHUTDOWN.get() {
+        token.cancel();
+    }
+}
+
 use crate::api::deploy::TriggerRequest;
 use crate::config::{
     autoupdate::{AutoUpdateConfig, AutoUpdateState},
@@ -14,7 +31,7 @@ use crate::config::{
 };
 use crate::domain::tunnel::{PortMapping, TunnelMode};
 use crate::infra::DeployCenterClient;
-use crate::services::{frp::FrpcManager, nfa::NfaSupervisor, ssh::SshServer};
+use crate::services::{frp::FrpcManager, mesh::MeshClient, nfa::NfaSupervisor, ssh::SshServer};
 
 use super::log_hub::LogHub;
 use super::port_listener_manager::PortListenerManager;
@@ -92,6 +109,10 @@ pub struct AppState {
     pub auto_update_config: Option<AutoUpdateConfig>,
     /// 自动更新状态
     pub auto_update_state: Arc<AutoUpdateState>,
+
+    // ========== Service Mesh ==========
+    /// Mesh 客户端（用于服务发现和端点解析）
+    pub mesh_client: Option<Arc<MeshClient>>,
 }
 
 impl AppState {
@@ -134,6 +155,17 @@ impl AppState {
             None
         };
 
+        // 初始化 Mesh 客户端（如果配置了）
+        let mesh_client = crate::services::mesh::MeshConfig::from_env().map(|mesh_config| {
+            tracing::info!(
+                agent_id = %mesh_config.agent_id,
+                registry_url = %mesh_config.registry_url,
+                enabled = mesh_config.enabled,
+                "Mesh client configured"
+            );
+            Arc::new(MeshClient::new(mesh_config))
+        });
+
         Self {
             api_key: config.api_key.clone(),
             projects,
@@ -161,6 +193,8 @@ impl AppState {
 
             auto_update_config: config.auto_update.clone(),
             auto_update_state: Arc::new(AutoUpdateState::new()),
+
+            mesh_client,
 
             config,
         }

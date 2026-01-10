@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::domain::tunnel::{PortMapping, TunnelMessage};
@@ -21,8 +22,17 @@ const RECONNECT_DELAY_SECS: u64 = 5;
 const PING_INTERVAL_SECS: u64 = 30;
 const READ_BUFFER_SIZE: usize = 65536;
 
+/// 客户端运行结果
+#[derive(Debug)]
+pub enum ClientResult {
+    /// 正常断开
+    Disconnected,
+    /// 收到 shutdown 信号，优雅退出
+    Shutdown,
+}
+
 /// 启动隧道客户端
-pub async fn start(state: Arc<AppState>) {
+pub async fn start(state: Arc<AppState>, shutdown_token: CancellationToken) {
     let server_url = state.tunnel_server_url.clone();
     let client_id = state.tunnel_client_id.clone();
     let auth_token = state.tunnel_auth_token.clone();
@@ -42,18 +52,43 @@ pub async fn start(state: Arc<AppState>) {
     );
 
     loop {
+        // 检查 shutdown 信号
+        if shutdown_token.is_cancelled() {
+            info!("Tunnel client received shutdown signal before connect");
+            break;
+        }
+
         // 重置状态
         *client_state.connected.write().await = false;
         *client_state.connected_at.write().await = None;
 
-        match run_client(&server_url, &client_id, &auth_token, &mappings, client_state.clone()).await {
-            Ok(()) => {
+        match run_client(
+            &server_url,
+            &client_id,
+            &auth_token,
+            &mappings,
+            client_state.clone(),
+            shutdown_token.clone(),
+        )
+        .await
+        {
+            Ok(ClientResult::Disconnected) => {
                 info!("Tunnel client disconnected normally");
+            }
+            Ok(ClientResult::Shutdown) => {
+                info!("Tunnel client shutdown gracefully");
+                break;
             }
             Err(e) => {
                 error!(error = %e, "Tunnel client error");
                 *client_state.last_error.write().await = Some(e.to_string());
             }
+        }
+
+        // 检查 shutdown 信号
+        if shutdown_token.is_cancelled() {
+            info!("Tunnel client received shutdown signal, not reconnecting");
+            break;
         }
 
         // 增加重连计数
@@ -62,8 +97,18 @@ pub async fn start(state: Arc<AppState>) {
         drop(count);
 
         info!(delay_secs = RECONNECT_DELAY_SECS, "Reconnecting tunnel client");
-        tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+
+        // 使用 select 等待重连延迟或 shutdown 信号
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)) => {}
+            _ = shutdown_token.cancelled() => {
+                info!("Tunnel client received shutdown signal during reconnect delay");
+                break;
+            }
+        }
     }
+
+    info!("Tunnel client stopped");
 }
 
 /// 运行客户端连接
@@ -73,7 +118,8 @@ async fn run_client(
     auth_token: &str,
     mappings: &[PortMapping],
     client_state: Arc<crate::state::TunnelClientState>,
-) -> anyhow::Result<()> {
+    shutdown_token: CancellationToken,
+) -> anyhow::Result<ClientResult> {
     // 构建 WebSocket URL，添加认证 token 作为 header
     let url = url::Url::parse(server_url)?;
 
@@ -117,8 +163,22 @@ async fn run_client(
     // 心跳定时器
     let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
 
+    // 是否因 shutdown 退出
+    let mut shutdown_triggered = false;
+
     loop {
         tokio::select! {
+            // 优先处理 shutdown 信号
+            _ = shutdown_token.cancelled() => {
+                info!("Tunnel client received shutdown signal, closing connection gracefully");
+                shutdown_triggered = true;
+                // 发送 WebSocket Close 帧
+                if let Err(e) = ws_tx.send(Message::Close(None)).await {
+                    warn!(error = %e, "Failed to send WebSocket close frame");
+                }
+                break;
+            }
+
             // 处理来自服务端的消息
             msg = ws_rx.next() => {
                 match msg {
@@ -196,7 +256,11 @@ async fn run_client(
 
     *client_state.connected.write().await = false;
 
-    Ok(())
+    if shutdown_triggered {
+        Ok(ClientResult::Shutdown)
+    } else {
+        Ok(ClientResult::Disconnected)
+    }
 }
 
 /// 处理来自服务端的消息
