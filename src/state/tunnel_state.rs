@@ -1,16 +1,18 @@
 //! 隧道运行时状态
 //!
-//! 包含 tokio 同步原语的运行时状态，与 domain/tunnel.rs 的纯数据类型分离
+//! 包含 tokio 同步原语的运行时状态，与 domain/tunnel.rs 的纯数据类型分离。
+//! 注意：端口监听器现在由 PortListenerManager 独立管理，不再与客户端生命周期耦合。
 
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio_util::sync::CancellationToken;
 
 use crate::domain::tunnel::{PortMapping, TunnelMessage};
 
 /// 单个客户端的状态 (Server 视角)
+///
+/// 仅管理客户端的 WebSocket 连接信息，端口监听器由 PortListenerManager 独立管理。
 pub struct ClientState {
     /// 客户端 ID
     pub client_id: String,
@@ -22,10 +24,6 @@ pub struct ClientState {
     pub mappings: Vec<PortMapping>,
     /// 发送消息到 WebSocket 客户端的通道
     pub ws_tx: mpsc::Sender<TunnelMessage>,
-    /// 活跃的代理连接 (conn_id -> 发送通道)
-    pub proxy_connections: HashMap<String, mpsc::Sender<Vec<u8>>>,
-    /// 端口监听器取消令牌 (port -> cancel_token)
-    pub port_listeners: HashMap<u16, CancellationToken>,
 }
 
 impl ClientState {
@@ -40,8 +38,6 @@ impl ClientState {
             connected_at: Utc::now(),
             mappings: Vec::new(),
             ws_tx,
-            proxy_connections: HashMap::new(),
-            port_listeners: HashMap::new(),
         }
     }
 }
@@ -73,16 +69,13 @@ impl TunnelServerState {
         clients.insert(client_id, client_state);
     }
 
-    /// 移除客户端并清理资源
+    /// 移除客户端
+    ///
+    /// 注意：端口监听器由 PortListenerManager 管理，这里只清理客户端状态。
+    /// 调用者需要单独调用 PortListenerManager::unbind_client() 来解绑端口。
     pub async fn remove_client(&self, client_id: &str) -> Option<ClientState> {
         let mut clients = self.clients.write().await;
-        if let Some(mut client) = clients.remove(client_id) {
-            // 取消所有端口监听器
-            for (port, cancel_token) in client.port_listeners.drain() {
-                tracing::info!(client_id = %client_id, port = port, "Stopping port listener");
-                cancel_token.cancel();
-            }
-
+        if let Some(client) = clients.remove(client_id) {
             // 从端口映射中移除
             let mut port_to_client = self.port_to_client.write().await;
             port_to_client.retain(|_, cid| cid != client_id);

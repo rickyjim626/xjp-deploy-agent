@@ -17,6 +17,7 @@ use crate::infra::DeployCenterClient;
 use crate::services::{frp::FrpcManager, nfa::NfaSupervisor, ssh::SshServer};
 
 use super::log_hub::LogHub;
+use super::port_listener_manager::PortListenerManager;
 use super::task_store::TaskStore;
 use super::tunnel_state::{TunnelClientState, TunnelServerState};
 
@@ -71,6 +72,8 @@ pub struct AppState {
     pub tunnel_server_state: Arc<TunnelServerState>,
     /// 隧道客户端状态 (仅 Client 模式)
     pub tunnel_client_state: Arc<TunnelClientState>,
+    /// 端口监听器管理器 (仅 Server 模式)
+    pub port_listener_manager: Arc<PortListenerManager>,
     /// 端口映射配置 (Client 模式)
     pub tunnel_port_mappings: Vec<PortMapping>,
     /// 隧道服务端 URL (Client 模式)
@@ -148,6 +151,7 @@ impl AppState {
             tunnel_auth_token: config.tunnel.auth_token.clone(),
             tunnel_server_state: Arc::new(TunnelServerState::new()),
             tunnel_client_state: Arc::new(TunnelClientState::new()),
+            port_listener_manager: Arc::new(PortListenerManager::new()),
             tunnel_port_mappings: config.tunnel.port_mappings.clone(),
             tunnel_server_url: config.tunnel.server_url.clone(),
 

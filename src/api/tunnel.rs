@@ -61,34 +61,47 @@ async fn get_tunnel_status(
     let response = match &state.tunnel_mode {
         TunnelMode::Server => {
             let server_state = &state.tunnel_server_state;
+            let port_manager = &state.port_listener_manager;
             let clients_guard = server_state.clients.read().await;
 
+            // 获取所有监听器状态
+            let all_listeners = port_manager.get_all_listeners().await;
+
             // 收集所有连接的客户端信息
-            let connected_clients: Vec<ConnectedClientInfo> = clients_guard
-                .values()
-                .map(|client| {
-                    let port_mappings: Vec<PortMappingStatus> = client
-                        .mappings
+            let mut connected_clients: Vec<ConnectedClientInfo> = Vec::new();
+
+            for client in clients_guard.values() {
+                let mut port_mappings: Vec<PortMappingStatus> = Vec::new();
+
+                for m in &client.mappings {
+                    // 查找监听器状态
+                    let (status, active_conns) = all_listeners
                         .iter()
-                        .map(|m| PortMappingStatus {
-                            mapping: m.clone(),
-                            status: if client.port_listeners.contains_key(&m.remote_port) {
+                        .find(|(port, _, _, _)| *port == m.remote_port)
+                        .map(|(_, _, bound_client, conn_count)| {
+                            let status = if bound_client.as_deref() == Some(&client.client_id) {
                                 "listening".to_string()
                             } else {
                                 "pending".to_string()
-                            },
-                            active_connections: 0,
+                            };
+                            (status, *conn_count)
                         })
-                        .collect();
+                        .unwrap_or(("pending".to_string(), 0));
 
-                    ConnectedClientInfo {
-                        client_id: client.client_id.clone(),
-                        client_addr: client.client_addr.clone(),
-                        connected_at: client.connected_at,
-                        port_mappings,
-                    }
-                })
-                .collect();
+                    port_mappings.push(PortMappingStatus {
+                        mapping: m.clone(),
+                        status,
+                        active_connections: active_conns,
+                    });
+                }
+
+                connected_clients.push(ConnectedClientInfo {
+                    client_id: client.client_id.clone(),
+                    client_addr: client.client_addr.clone(),
+                    connected_at: client.connected_at,
+                    port_mappings,
+                });
+            }
 
             let client_count = connected_clients.len();
 
