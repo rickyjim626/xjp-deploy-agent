@@ -244,14 +244,25 @@ async fn download_and_apply_update(
     let temp_dir = std::env::temp_dir();
     let temp_binary_path = temp_dir.join(format!("xjp-deploy-agent-{}", metadata.version));
 
-    download_binary(&binary_url, &temp_binary_path).await?;
+    if let Err(e) = download_binary(&binary_url, &temp_binary_path).await {
+        // 下载失败，重置进度状态
+        *state.auto_update_state.update_progress.write().await = "none".to_string();
+        tracing::error!(error = %e, url = %binary_url, "Download failed");
+        return Err(e);
+    }
 
     // Step 2: 验证校验和 (如果有)
     if let Some(ref expected_sha256) = metadata.sha256 {
         *state.auto_update_state.update_progress.write().await = "verifying".to_string();
         tracing::info!("Verifying checksum");
 
-        verify_checksum(&temp_binary_path, expected_sha256).await?;
+        if let Err(e) = verify_checksum(&temp_binary_path, expected_sha256).await {
+            // 校验失败，清理临时文件并重置状态
+            let _ = fs::remove_file(&temp_binary_path).await;
+            *state.auto_update_state.update_progress.write().await = "none".to_string();
+            tracing::error!(error = %e, "Checksum verification failed");
+            return Err(e);
+        }
         tracing::info!("Checksum verified");
     }
 
@@ -288,6 +299,9 @@ async fn download_and_apply_update(
         if backup_binary.exists() {
             let _ = fs::rename(&backup_binary, &current_binary).await;
         }
+        // 重置进度状态
+        *state.auto_update_state.update_progress.write().await = "none".to_string();
+        tracing::error!(error = %e, "Failed to replace binary");
         return Err(format!("Failed to replace binary: {}", e).into());
     }
 
