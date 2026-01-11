@@ -1,9 +1,9 @@
 //! 服务路由器
 //!
-//! 智能选择服务端点，优先级：Local > LAN > Mesh > Public
+//! 智能选择服务端点，优先级：Local > Tunnel > LAN > Mesh > Public
 //!
 //! 这是服务发现的核心组件，负责：
-//! - 聚合多个服务发现源（LAN Discovery, Mesh, 配置）
+//! - 聚合多个服务发现源（LAN Discovery, Mesh, 配置, 隧道）
 //! - 根据优先级和健康状态选择最佳端点
 //! - 提供统一的服务解析 API
 
@@ -15,12 +15,15 @@ use tracing::{debug, info, warn};
 
 use super::lan_discovery::LanDiscovery;
 use super::mesh::MeshClient;
+use crate::state::tunnel_state::TunnelServerState;
 
 /// 端点来源
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointSource {
     /// 本地服务（localhost）
     Local,
+    /// 隧道暴露的服务（通过隧道客户端的端口映射）
+    Tunnel,
     /// LAN 发现的 peer
     LanPeer,
     /// Mesh 解析
@@ -36,6 +39,7 @@ impl EndpointSource {
     pub fn priority(&self) -> i32 {
         match self {
             EndpointSource::Local => 0,
+            EndpointSource::Tunnel => 5,
             EndpointSource::LanPeer => 10,
             EndpointSource::Mesh => 20,
             EndpointSource::Config => 30,
@@ -118,6 +122,8 @@ pub struct ServiceRouter {
     lan_discovery: Option<Arc<LanDiscovery>>,
     /// Mesh 客户端（可选）
     mesh_client: Option<Arc<MeshClient>>,
+    /// 隧道服务器状态（可选，仅 Server 模式）
+    tunnel_server_state: Option<Arc<TunnelServerState>>,
     /// 端点缓存
     cache: Arc<RwLock<HashMap<String, CachedEndpoint>>>,
 }
@@ -134,18 +140,20 @@ impl ServiceRouter {
         config: ServiceRouterConfig,
         lan_discovery: Option<Arc<LanDiscovery>>,
         mesh_client: Option<Arc<MeshClient>>,
+        tunnel_server_state: Option<Arc<TunnelServerState>>,
     ) -> Self {
         Self {
             config,
             lan_discovery,
             mesh_client,
+            tunnel_server_state,
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// 获取服务端点，按优先级选择最佳端点
     ///
-    /// 优先级：Local > LAN > Mesh > Config > Fallback
+    /// 优先级：Local > Tunnel > LAN > Mesh > Config > Fallback
     pub async fn get_endpoint(&self, service_id: &str) -> ServiceEndpoint {
         // 检查缓存（缓存 30 秒）
         {
@@ -188,7 +196,34 @@ impl ServiceRouter {
             };
         }
 
-        // 2. 检查 LAN 发现的 peer
+        // 2. 检查隧道客户端暴露的服务 (Server 模式)
+        // 隧道客户端通过 PortMapping 暴露服务，name 字段标识服务类型
+        if let Some(ref tunnel_state) = self.tunnel_server_state {
+            let clients = tunnel_state.clients.read().await;
+            for client in clients.values() {
+                for mapping in &client.mappings {
+                    if mapping.name == service_id {
+                        let url = format!("http://localhost:{}", mapping.remote_port);
+                        info!(
+                            service_id = service_id,
+                            url = %url,
+                            client_id = %client.client_id,
+                            remote_port = mapping.remote_port,
+                            "Using tunnel client endpoint"
+                        );
+                        return ServiceEndpoint {
+                            url,
+                            source: EndpointSource::Tunnel,
+                            latency_ms: Some(1.0), // 隧道延迟约 1ms
+                            healthy: true,
+                            metadata: HashMap::new(),
+                        };
+                    }
+                }
+            }
+        }
+
+        // 3. 检查 LAN 发现的 peer
         if let Some(ref discovery) = self.lan_discovery {
             if discovery.is_enabled() {
                 if let Some(url) = discovery.get_service_url(service_id).await {
@@ -216,7 +251,7 @@ impl ServiceRouter {
             }
         }
 
-        // 3. 检查 Mesh
+        // 4. 检查 Mesh
         if let Some(ref mesh) = self.mesh_client {
             if mesh.is_enabled() {
                 match mesh.get_service_url(service_id).await {
@@ -245,7 +280,7 @@ impl ServiceRouter {
             }
         }
 
-        // 4. 检查配置的端点
+        // 5. 检查配置的端点
         if let Some(url) = self.config.configured_endpoints.get(service_id) {
             debug!(service_id = service_id, url = %url, "Using configured endpoint");
             return ServiceEndpoint {
@@ -257,7 +292,7 @@ impl ServiceRouter {
             };
         }
 
-        // 5. 回退端点
+        // 6. 回退端点
         if let Some(url) = self.config.fallback_endpoints.get(service_id) {
             warn!(
                 service_id = service_id,

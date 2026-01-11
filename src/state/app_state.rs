@@ -197,12 +197,23 @@ impl AppState {
             Arc::new(LanDiscovery::new(lan_config))
         });
 
+        // 初始化隧道状态（需要先于 ServiceRouter 创建）
+        let tunnel_server_state = Arc::new(TunnelServerState::new());
+        let tunnel_client_state = Arc::new(TunnelClientState::new());
+
         // 初始化服务路由器
+        // Server 模式下传入 tunnel_server_state，以便从隧道客户端发现服务
         let router_config = ServiceRouterConfig::from_env();
+        let tunnel_state_for_router = if config.tunnel.mode == TunnelMode::Server {
+            Some(tunnel_server_state.clone())
+        } else {
+            None
+        };
         let service_router = Some(Arc::new(ServiceRouter::new(
             router_config,
             lan_discovery.clone(),
             mesh_client.clone(),
+            tunnel_state_for_router,
         )));
 
         Self {
@@ -220,8 +231,8 @@ impl AppState {
             tunnel_mode: config.tunnel.mode.clone(),
             tunnel_client_id: config.tunnel.client_id.clone(),
             tunnel_auth_token: config.tunnel.auth_token.clone(),
-            tunnel_server_state: Arc::new(TunnelServerState::new()),
-            tunnel_client_state: Arc::new(TunnelClientState::new()),
+            tunnel_server_state,
+            tunnel_client_state,
             port_listener_manager: Arc::new(PortListenerManager::new()),
             tunnel_port_mappings: config.tunnel.port_mappings.clone(),
             tunnel_server_url: config.tunnel.server_url.clone(),
