@@ -85,8 +85,8 @@ impl ServiceRouterConfig {
             .unwrap_or_default();
 
         // 默认回退端点
+        // 注意：rustfs 不配置 fallback，让 autoupdate 回退到配置文件中的端点（阿里云 OSS）
         let mut fallback_endpoints = HashMap::new();
-        fallback_endpoints.insert("rustfs".to_string(), "https://s3.xiaojinpro.top".to_string());
         fallback_endpoints.insert("deploy-center".to_string(), "https://auth.xiaojinpro.com".to_string());
 
         Self {
