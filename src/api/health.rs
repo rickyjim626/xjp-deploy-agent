@@ -3,11 +3,13 @@
 //! 包含 /health, /status, /projects, /restart 端点
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
+    http::HeaderMap,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use std::net::SocketAddr;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -215,11 +217,38 @@ async fn list_projects(
 /// 使用统一的 RestartManager 处理不同平台的重启逻辑
 async fn restart_service(
     _auth: RequireApiKey,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(_state): State<Arc<AppState>>,
 ) -> ApiResult<Json<RestartResponse>> {
     use crate::services::restart::{RestartManager, RestartMode};
 
-    tracing::info!("Restart requested via API, scheduling restart...");
+    // Log caller information for debugging
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let x_real_ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let referer = headers
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+
+    tracing::warn!(
+        remote_addr = %addr,
+        x_forwarded_for = %x_forwarded_for,
+        x_real_ip = %x_real_ip,
+        user_agent = %user_agent,
+        referer = %referer,
+        "RESTART REQUESTED - tracking caller info"
+    );
 
     // 检测运行模式
     #[cfg(windows)]
