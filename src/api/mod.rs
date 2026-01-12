@@ -10,6 +10,7 @@ pub mod database;
 pub mod tunnel;
 pub mod nfa;
 pub mod lan;
+pub mod images;
 
 use axum::Router;
 use std::sync::Arc;
@@ -30,6 +31,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(containers::router())
         // Deploy
         .merge(deploy::router())
+        // Images (Phase 4.4: prefetch)
+        .merge(images::router())
         // Database
         .merge(database::router())
         // Tunnel
