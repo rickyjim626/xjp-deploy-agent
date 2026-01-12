@@ -1,12 +1,15 @@
 //! Docker Compose deployment execution with Blue-Green deployment
 //!
 //! Handles Docker Compose deployments with zero-downtime:
-//! 1. Pull new image
+//! 1. Pull new image (parallelized with git pull)
 //! 2. Start canary container for health check
 //! 3. Wait for Docker HEALTHCHECK to report healthy (smart wait)
 //! 4. If healthy, proceed with compose up
 //! 5. If unhealthy, abort and keep old container running
 //! 6. Post-deploy monitoring for 90 seconds to catch startup issues
+//!
+//! Phase 4.1 Optimization: Git pull and Docker pull run in parallel
+//! to reduce cold start time by 5-30 seconds.
 
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -29,12 +32,18 @@ pub struct DockerComposeConfig {
 const CANARY_CONTAINER_PREFIX: &str = "deploy-canary";
 /// Maximum time to wait for canary to become healthy
 const CANARY_MAX_WAIT_SECONDS: u64 = 60;
-/// Interval between health status checks
-const HEALTH_CHECK_INTERVAL_MS: u64 = 500;
 /// Post-deploy monitoring duration
 const POST_DEPLOY_MONITOR_SECONDS: u64 = 90;
 /// Maximum restarts before triggering alert
 const MAX_RESTARTS_BEFORE_ALERT: u32 = 2;
+
+// Phase 4.2: Adaptive health check intervals (exponential backoff)
+/// Initial health check interval - start fast to catch quick-starting services
+const HEALTH_CHECK_INITIAL_MS: u64 = 100;
+/// Maximum health check interval - cap to avoid missing issues
+const HEALTH_CHECK_MAX_MS: u64 = 2000;
+/// Backoff multiplier - increase interval by this factor each iteration
+const HEALTH_CHECK_BACKOFF_FACTOR: f64 = 1.5;
 
 /// Extended fatal error patterns for Rust/Axum applications
 /// Note: Patterns are matched case-insensitively
@@ -102,8 +111,11 @@ fn canary_container_name(task_id: &str) -> String {
 
 /// Clean up any stale canary containers from previous deployments
 /// This runs at the start of deployment to ensure a clean state
+///
+/// Phase 4.3: Runs cleanup in background to not block deployment
+/// Returns immediately after spawning cleanup task
 async fn cleanup_stale_canaries(ctx: &DeployContext) {
-    ctx.log_stdout(">>> Cleaning up stale canary containers...")
+    ctx.log_stdout(">>> Cleaning up stale canary containers (background)...")
         .await;
 
     // Find all containers matching the canary prefix
@@ -117,38 +129,35 @@ async fn cleanup_stale_canaries(ctx: &DeployContext) {
 
     if let Ok(output) = list_result {
         if output.status.success() {
-            let container_ids = String::from_utf8_lossy(&output.stdout);
-            let ids: Vec<&str> = container_ids.lines().filter(|s| !s.is_empty()).collect();
+            let container_ids = String::from_utf8_lossy(&output.stdout).to_string();
+            let ids: Vec<String> = container_ids
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_string())
+                .collect();
 
             if ids.is_empty() {
                 ctx.log_stdout("No stale canary containers found").await;
                 return;
             }
 
-            ctx.log_stdout(&format!("Found {} stale canary container(s), removing...", ids.len()))
+            let count = ids.len();
+            ctx.log_stdout(&format!("Found {} stale canary container(s), cleaning in background...", count))
                 .await;
 
-            for id in ids {
-                let rm_result = Command::new("docker")
-                    .args(["rm", "-f", id.trim()])
-                    .output()
-                    .await;
-
-                match rm_result {
-                    Ok(rm_output) if rm_output.status.success() => {
-                        ctx.log_stdout(&format!("  Removed: {}", id.trim())).await;
-                    }
-                    Ok(rm_output) => {
-                        let stderr = String::from_utf8_lossy(&rm_output.stderr);
-                        ctx.log_stderr(&format!("  Failed to remove {}: {}", id.trim(), stderr))
-                            .await;
-                    }
-                    Err(e) => {
-                        ctx.log_stderr(&format!("  Error removing {}: {}", id.trim(), e))
-                            .await;
-                    }
+            // Phase 4.3: Spawn background task to clean up containers
+            // This allows the deployment to continue without waiting
+            tokio::spawn(async move {
+                for id in ids {
+                    let _ = Command::new("docker")
+                        .args(["rm", "-f", &id])
+                        .output()
+                        .await;
+                    // Small delay between removals to avoid overwhelming docker
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-            }
+                tracing::debug!("Background cleanup of {} canary containers completed", count);
+            });
         }
     }
 }
@@ -207,99 +216,93 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
     ))
     .await;
 
-    // Stage 1: Git pull (if configured)
-    stages[0].start();
-    ctx.update_stages(stages.clone()).await;
+    // Stage 1 & 2: Git pull and Docker pull (PARALLELIZED)
+    // Phase 4.1 optimization: Run these operations concurrently to save 5-30 seconds
+    ctx.log_stdout("[1-2/5] Running Git pull and Docker pull in parallel...").await;
 
-    if let Some(ref git_dir) = config.git_repo_dir {
-        ctx.log_stdout("[1/4] Updating repository...").await;
-        ctx.log_stdout(&format!(">>> git pull (in {})", git_dir))
-            .await;
-
-        let git_result = Command::new("git")
-            .args(["pull", "--ff-only", "origin", "master"])
-            .current_dir(git_dir)
-            .output()
-            .await;
-
-        match git_result {
-            Ok(output) => {
-                if !output.stdout.is_empty() {
-                    ctx.log_stdout(&String::from_utf8_lossy(&output.stdout))
-                        .await;
-                }
-                if !output.stderr.is_empty() {
-                    ctx.log_stderr(&String::from_utf8_lossy(&output.stderr))
-                        .await;
-                }
-                if output.status.success() {
-                    stages[0].finish(true, None);
-                } else {
-                    stages[0].finish(false, Some("git pull failed, continuing".to_string()));
-                    ctx.log_stderr("Warning: git pull failed, continuing with existing files")
-                        .await;
-                }
-            }
-            Err(e) => {
-                stages[0].finish(false, Some(e.to_string()));
-                ctx.log_stderr(&format!("Warning: Failed to run git pull: {}", e))
-                    .await;
-            }
-        }
+    let has_git = config.git_repo_dir.is_some();
+    if has_git {
+        stages[0].start();
     } else {
         stages[0].skip(Some("not configured".to_string()));
-        ctx.log_stdout("[1/4] Skipping git pull (not configured)")
-            .await;
     }
+    stages[1].start();
     ctx.update_stages(stages.clone()).await;
 
-    // Check cancellation
-    if ctx.is_cancelled() {
-        ctx.log_stderr("Deployment cancelled").await;
-        ctx.finish(DeployStatus::Failed, Some(-2), stages).await;
-        return;
+    // Log what we're doing
+    if let Some(ref git_dir) = config.git_repo_dir {
+        ctx.log_stdout(&format!(">>> git pull (in {}) [parallel]", git_dir)).await;
     }
+    ctx.log_stdout(&format!(">>> docker pull {} [parallel]", config.image)).await;
 
-    // Stage 2: Docker pull image
-    if exit_code == 0 {
-        stages[1].start();
-        ctx.update_stages(stages.clone()).await;
-        ctx.log_stdout("[2/4] Pulling Docker image...").await;
-        ctx.log_stdout(&format!(">>> docker pull {}", config.image))
-            .await;
+    // Record start time for parallel operations
+    let parallel_start = Instant::now();
 
-        let pull_result = Command::new("docker")
-            .args(["pull", &config.image])
-            .output()
-            .await;
+    // Run git pull and docker pull in parallel
+    let (git_result, docker_result) = if let Some(ref git_dir) = config.git_repo_dir {
+        let git_dir_owned = git_dir.clone();
+        let image_owned = config.image.clone();
 
-        match pull_result {
-            Ok(output) => {
-                if !output.stdout.is_empty() {
-                    ctx.log_stdout(&String::from_utf8_lossy(&output.stdout))
-                        .await;
-                }
-                if !output.stderr.is_empty() {
-                    ctx.log_stderr(&String::from_utf8_lossy(&output.stderr))
-                        .await;
-                }
-                if output.status.success() {
-                    stages[1].finish(true, None);
-                } else {
-                    stages[1].finish(false, Some("docker pull failed".to_string()));
-                    ctx.log_stderr("Error: Failed to pull image").await;
-                    exit_code = output.status.code().unwrap_or(-1);
-                }
-            }
-            Err(e) => {
-                stages[1].finish(false, Some(e.to_string()));
-                ctx.log_stderr(&format!("Error: Failed to run docker pull: {}", e))
-                    .await;
-                exit_code = -1;
-            }
+        let (git_res, docker_res) = tokio::join!(
+            run_git_pull(&git_dir_owned),
+            run_docker_pull(&image_owned)
+        );
+        (Some(git_res), docker_res)
+    } else {
+        let image_owned = config.image.clone();
+        let docker_res = run_docker_pull(&image_owned).await;
+        (None, docker_res)
+    };
+
+    let parallel_elapsed = parallel_start.elapsed();
+    ctx.log_stdout(&format!(
+        "✓ Parallel pull completed in {:.1}s",
+        parallel_elapsed.as_secs_f64()
+    )).await;
+
+    // Process git pull result
+    if let Some(git_res) = git_result {
+        if !git_res.stdout.is_empty() {
+            ctx.log_stdout(&format!("[git stdout] {}", git_res.stdout)).await;
         }
-        ctx.update_stages(stages.clone()).await;
+        if !git_res.stderr.is_empty() {
+            ctx.log_stderr(&format!("[git stderr] {}", git_res.stderr)).await;
+        }
+
+        if git_res.success {
+            stages[0].finish(true, None);
+            ctx.log_stdout("✓ Git pull succeeded").await;
+        } else {
+            stages[0].finish(false, git_res.error_message.clone());
+            ctx.log_stderr(&format!(
+                "Warning: git pull failed: {}, continuing with existing files",
+                git_res.error_message.unwrap_or_default()
+            )).await;
+        }
     }
+
+    // Process docker pull result
+    if !docker_result.stdout.is_empty() {
+        ctx.log_stdout(&format!("[docker stdout] {}", docker_result.stdout)).await;
+    }
+    if !docker_result.stderr.is_empty() {
+        // Docker pull writes progress to stderr, use stdout for non-error output
+        ctx.log_stdout(&format!("[docker stderr] {}", docker_result.stderr)).await;
+    }
+
+    if docker_result.success {
+        stages[1].finish(true, None);
+        ctx.log_stdout("✓ Docker pull succeeded").await;
+    } else {
+        stages[1].finish(false, docker_result.error_message.clone());
+        ctx.log_stderr(&format!(
+            "Error: Docker pull failed: {}",
+            docker_result.error_message.unwrap_or_default()
+        )).await;
+        exit_code = docker_result.exit_code;
+    }
+
+    ctx.update_stages(stages.clone()).await;
 
     // Check cancellation
     if ctx.is_cancelled() && exit_code == 0 {
@@ -312,7 +315,7 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
     if exit_code == 0 {
         stages[2].start();
         ctx.update_stages(stages.clone()).await;
-        ctx.log_stdout("[3/4] Running canary health check...").await;
+        ctx.log_stdout("[3/5] Running canary health check...").await;
 
         // Run canary health check using docker-compose to inherit env vars
         // Default health port is 3000 (monolith), BFF uses 3001
@@ -351,7 +354,7 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
         stages[3].start();
         ctx.update_stages(stages.clone()).await;
         let service_str = config.service.as_deref().unwrap_or("all services");
-        ctx.log_stdout(&format!("[4/4] Swapping to new container: {}...", service_str))
+        ctx.log_stdout(&format!("[4/5] Swapping to new container: {}...", service_str))
             .await;
 
         // First, compose pull to ensure compose knows about the new image
@@ -675,6 +678,11 @@ async fn run_canary_health_check(
 
 /// Wait for a container to become healthy using Docker's HEALTHCHECK status
 ///
+/// Phase 4.2: Uses adaptive exponential backoff for health check intervals
+/// - Starts fast (100ms) to catch quick-starting services
+/// - Gradually increases to max (2000ms) if container takes longer
+/// - Reduces unnecessary polling while maintaining responsiveness
+///
 /// Returns the elapsed time in seconds if healthy, or an error message
 async fn wait_for_container_healthy(
     ctx: &DeployContext,
@@ -683,12 +691,20 @@ async fn wait_for_container_healthy(
 ) -> Result<f64, String> {
     let start = Instant::now();
     let max_duration = Duration::from_secs(max_wait_secs);
-    let check_interval = Duration::from_millis(HEALTH_CHECK_INTERVAL_MS);
+
+    // Phase 4.2: Adaptive health check interval with exponential backoff
+    let mut current_interval_ms = HEALTH_CHECK_INITIAL_MS as f64;
+    let mut check_count = 0u32;
 
     loop {
         if start.elapsed() > max_duration {
-            return Err(format!("Timeout after {}s waiting for healthy status", max_wait_secs));
+            return Err(format!(
+                "Timeout after {}s waiting for healthy status ({} checks performed)",
+                max_wait_secs, check_count
+            ));
         }
+
+        check_count += 1;
 
         // Get container state
         let inspect_result = Command::new("docker")
@@ -721,6 +737,10 @@ async fn wait_for_container_healthy(
                 // Check Docker HEALTHCHECK status
                 match *health_status {
                     "healthy" => {
+                        ctx.log_stdout(&format!(
+                            "Health check succeeded after {} checks (final interval: {}ms)",
+                            check_count, current_interval_ms as u64
+                        )).await;
                         return Ok(start.elapsed().as_secs_f64());
                     }
                     "unhealthy" => {
@@ -735,7 +755,10 @@ async fn wait_for_container_healthy(
                             if *container_status == "running" {
                                 // Give it a moment to stabilize, then accept
                                 if start.elapsed().as_secs() >= 3 {
-                                    ctx.log_stdout("Note: No Docker HEALTHCHECK defined, using running status").await;
+                                    ctx.log_stdout(&format!(
+                                        "Note: No Docker HEALTHCHECK defined, using running status ({} checks)",
+                                        check_count
+                                    )).await;
                                     return Ok(start.elapsed().as_secs_f64());
                                 }
                             }
@@ -758,7 +781,12 @@ async fn wait_for_container_healthy(
             }
         }
 
-        tokio::time::sleep(check_interval).await;
+        // Sleep with current interval
+        tokio::time::sleep(Duration::from_millis(current_interval_ms as u64)).await;
+
+        // Apply exponential backoff for next iteration (capped at max)
+        current_interval_ms = (current_interval_ms * HEALTH_CHECK_BACKOFF_FACTOR)
+            .min(HEALTH_CHECK_MAX_MS as f64);
     }
 }
 
@@ -1148,6 +1176,101 @@ async fn report_post_deploy_issue(
 
     // TODO: In the future, add a dedicated endpoint for post-deploy alerts
     // that can trigger notifications, auto-rollback, etc.
+}
+
+/// Result of a git pull operation
+struct GitPullResult {
+    success: bool,
+    error_message: Option<String>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Result of a docker pull operation
+struct DockerPullResult {
+    success: bool,
+    error_message: Option<String>,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run git pull in a separate async task (for parallel execution)
+async fn run_git_pull(git_dir: &str) -> GitPullResult {
+    let git_result = Command::new("git")
+        .args(["pull", "--ff-only", "origin", "master"])
+        .current_dir(git_dir)
+        .output()
+        .await;
+
+    match git_result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if output.status.success() {
+                GitPullResult {
+                    success: true,
+                    error_message: None,
+                    stdout,
+                    stderr,
+                }
+            } else {
+                GitPullResult {
+                    success: false,
+                    error_message: Some("git pull failed, continuing".to_string()),
+                    stdout,
+                    stderr,
+                }
+            }
+        }
+        Err(e) => GitPullResult {
+            success: false,
+            error_message: Some(e.to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    }
+}
+
+/// Run docker pull in a separate async task (for parallel execution)
+async fn run_docker_pull(image: &str) -> DockerPullResult {
+    let pull_result = Command::new("docker")
+        .args(["pull", image])
+        .output()
+        .await;
+
+    match pull_result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if output.status.success() {
+                DockerPullResult {
+                    success: true,
+                    error_message: None,
+                    exit_code: 0,
+                    stdout,
+                    stderr,
+                }
+            } else {
+                DockerPullResult {
+                    success: false,
+                    error_message: Some("docker pull failed".to_string()),
+                    exit_code: output.status.code().unwrap_or(-1),
+                    stdout,
+                    stderr,
+                }
+            }
+        }
+        Err(e) => DockerPullResult {
+            success: false,
+            error_message: Some(format!("Failed to run docker pull: {}", e)),
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    }
 }
 
 /// Detect which docker-compose command to use
