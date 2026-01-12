@@ -25,8 +25,8 @@ pub struct DockerComposeConfig {
     pub health_port: Option<u16>,
 }
 
-/// Health check configuration
-const CANARY_CONTAINER_NAME: &str = "deploy-canary";
+/// Canary container name prefix (task_id will be appended)
+const CANARY_CONTAINER_PREFIX: &str = "deploy-canary";
 /// Maximum time to wait for canary to become healthy
 const CANARY_MAX_WAIT_SECONDS: u64 = 60;
 /// Interval between health status checks
@@ -88,6 +88,71 @@ const IGNORE_PATTERNS: &[&str] = &[
     "on conflict",                   // UPSERT statements
 ];
 
+/// Generate a unique canary container name using task_id
+/// This prevents conflicts when multiple deployments run concurrently
+fn canary_container_name(task_id: &str) -> String {
+    // Use first 8 chars of task_id for brevity while maintaining uniqueness
+    let short_id = if task_id.len() > 8 {
+        &task_id[..8]
+    } else {
+        task_id
+    };
+    format!("{}-{}", CANARY_CONTAINER_PREFIX, short_id)
+}
+
+/// Clean up any stale canary containers from previous deployments
+/// This runs at the start of deployment to ensure a clean state
+async fn cleanup_stale_canaries(ctx: &DeployContext) {
+    ctx.log_stdout(">>> Cleaning up stale canary containers...")
+        .await;
+
+    // Find all containers matching the canary prefix
+    let list_result = Command::new("docker")
+        .args([
+            "ps", "-a", "-q",
+            "--filter", &format!("name=^{}", CANARY_CONTAINER_PREFIX),
+        ])
+        .output()
+        .await;
+
+    if let Ok(output) = list_result {
+        if output.status.success() {
+            let container_ids = String::from_utf8_lossy(&output.stdout);
+            let ids: Vec<&str> = container_ids.lines().filter(|s| !s.is_empty()).collect();
+
+            if ids.is_empty() {
+                ctx.log_stdout("No stale canary containers found").await;
+                return;
+            }
+
+            ctx.log_stdout(&format!("Found {} stale canary container(s), removing...", ids.len()))
+                .await;
+
+            for id in ids {
+                let rm_result = Command::new("docker")
+                    .args(["rm", "-f", id.trim()])
+                    .output()
+                    .await;
+
+                match rm_result {
+                    Ok(rm_output) if rm_output.status.success() => {
+                        ctx.log_stdout(&format!("  Removed: {}", id.trim())).await;
+                    }
+                    Ok(rm_output) => {
+                        let stderr = String::from_utf8_lossy(&rm_output.stderr);
+                        ctx.log_stderr(&format!("  Failed to remove {}: {}", id.trim(), stderr))
+                            .await;
+                    }
+                    Err(e) => {
+                        ctx.log_stderr(&format!("  Error removing {}: {}", id.trim(), e))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Execute a Docker Compose deployment with blue-green strategy
 pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeConfig) {
     // Initialize stages - includes canary health check and post-deploy monitoring
@@ -116,6 +181,14 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
     .await;
     ctx.log_stdout("Strategy: Blue-Green (canary health check before swap)")
         .await;
+
+    // Generate unique canary container name for this deployment
+    let canary_name = canary_container_name(&ctx.task_id);
+    ctx.log_stdout(&format!("Canary container: {}", canary_name))
+        .await;
+
+    // Clean up any stale canary containers from previous failed deployments
+    cleanup_stale_canaries(ctx).await;
 
     let mut exit_code = 0;
 
@@ -246,7 +319,7 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
         let health_port = config.health_port.unwrap_or(3000);
         let canary_result = run_canary_health_check(
             ctx,
-            &config.image,
+            &canary_name,
             work_dir,
             &compose_path,
             config.service.as_deref(),
@@ -474,12 +547,13 @@ pub async fn execute(ctx: &DeployContext, work_dir: &str, config: DockerComposeC
 /// Run a canary container to verify the new image works before swapping
 ///
 /// Enhanced with:
+/// - Unique canary container name per deployment (prevents conflicts)
 /// - Smart wait using Docker HEALTHCHECK status instead of fixed delay
 /// - Extended fatal error pattern detection
-/// - Better diagnostics and logging
+/// - Strict cleanup with error reporting
 async fn run_canary_health_check(
     ctx: &DeployContext,
-    _image: &str,
+    canary_name: &str,
     work_dir: &str,
     compose_path: &str,
     service: Option<&str>,
@@ -487,13 +561,14 @@ async fn run_canary_health_check(
     docker_compose_args: &[&str],
     health_port: u16,
 ) -> Result<(), String> {
-    // Clean up any existing canary container
-    ctx.log_stdout(">>> Cleaning up any existing canary container...")
+    // Clean up this specific canary container if it exists (from a previous failed attempt)
+    ctx.log_stdout(&format!(">>> Ensuring canary container {} is clean...", canary_name))
         .await;
-    let _ = Command::new("docker")
-        .args(["rm", "-f", CANARY_CONTAINER_NAME])
-        .output()
-        .await;
+    if let Err(e) = cleanup_canary_strict(ctx, canary_name).await {
+        ctx.log_stderr(&format!("Warning: Failed to clean up existing canary: {}", e))
+            .await;
+        // Continue anyway - the docker run might still succeed
+    }
 
     // Use docker-compose run to start canary with correct environment
     let service_name = service.unwrap_or("xjp-backend");
@@ -501,7 +576,7 @@ async fn run_canary_health_check(
 
     ctx.log_stdout(&format!(
         ">>> {} -f {} run -d --name {} --no-deps -p {} {}",
-        docker_compose_cmd, compose_path, CANARY_CONTAINER_NAME, port_mapping, service_name
+        docker_compose_cmd, compose_path, canary_name, port_mapping, service_name
     ))
     .await;
 
@@ -509,7 +584,7 @@ async fn run_canary_health_check(
     args.extend([
         "-f", compose_path,
         "run", "-d",
-        "--name", CANARY_CONTAINER_NAME,
+        "--name", canary_name,
         "--no-deps",
         "-p", &port_mapping,
         service_name,
@@ -527,7 +602,7 @@ async fn run_canary_health_check(
         let stdout = String::from_utf8_lossy(&run_result.stdout);
         ctx.log_stderr(&format!("Canary start stderr: {}", stderr)).await;
         ctx.log_stdout(&format!("Canary start stdout: {}", stdout)).await;
-        cleanup_canary().await;
+        let _ = cleanup_canary_strict(ctx, canary_name).await;
         return Err(format!("Failed to start canary container: {}", stderr));
     }
 
@@ -538,7 +613,7 @@ async fn run_canary_health_check(
     ))
     .await;
 
-    let wait_result = wait_for_container_healthy(ctx, CANARY_CONTAINER_NAME, CANARY_MAX_WAIT_SECONDS).await;
+    let wait_result = wait_for_container_healthy(ctx, canary_name, CANARY_MAX_WAIT_SECONDS).await;
 
     match wait_result {
         Ok(elapsed_secs) => {
@@ -546,8 +621,8 @@ async fn run_canary_health_check(
         }
         Err(e) => {
             ctx.log_stderr(&format!("✗ Canary health wait failed: {}", e)).await;
-            show_container_logs(ctx, CANARY_CONTAINER_NAME, 50).await;
-            cleanup_canary().await;
+            show_container_logs(ctx, canary_name, 50).await;
+            let _ = cleanup_canary_strict(ctx, canary_name).await;
             return Err(e);
         }
     }
@@ -567,30 +642,33 @@ async fn run_canary_health_check(
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             ctx.log_stderr(&format!("✗ Canary HTTP check failed: {}", stderr)).await;
-            show_container_logs(ctx, CANARY_CONTAINER_NAME, 30).await;
-            cleanup_canary().await;
+            show_container_logs(ctx, canary_name, 30).await;
+            let _ = cleanup_canary_strict(ctx, canary_name).await;
             return Err("Canary HTTP health check failed".to_string());
         }
         Err(e) => {
             ctx.log_stderr(&format!("✗ Failed to run HTTP check: {}", e)).await;
-            cleanup_canary().await;
+            let _ = cleanup_canary_strict(ctx, canary_name).await;
             return Err(format!("Failed to run health check: {}", e));
         }
     }
 
     // Check container logs for fatal error patterns
     ctx.log_stdout(">>> Checking canary logs for fatal patterns...").await;
-    if let Some(pattern) = check_logs_for_fatal_patterns(CANARY_CONTAINER_NAME).await {
+    if let Some(pattern) = check_logs_for_fatal_patterns(canary_name).await {
         ctx.log_stderr(&format!("✗ Found fatal pattern in logs: '{}'", pattern)).await;
-        show_container_logs(ctx, CANARY_CONTAINER_NAME, 30).await;
-        cleanup_canary().await;
+        show_container_logs(ctx, canary_name, 30).await;
+        let _ = cleanup_canary_strict(ctx, canary_name).await;
         return Err(format!("Canary container has fatal error: {}", pattern));
     }
     ctx.log_stdout("✓ No fatal patterns found in logs").await;
 
     // Container is healthy - clean up canary
-    ctx.log_stdout(">>> Cleaning up canary container...").await;
-    cleanup_canary().await;
+    ctx.log_stdout(&format!(">>> Cleaning up canary container {}...", canary_name)).await;
+    if let Err(e) = cleanup_canary_strict(ctx, canary_name).await {
+        // Log but don't fail - the deployment itself succeeded
+        ctx.log_stderr(&format!("Warning: Failed to clean up canary: {}", e)).await;
+    }
 
     Ok(())
 }
@@ -769,12 +847,49 @@ async fn show_container_logs(ctx: &DeployContext, container: &str, lines: u32) {
     }
 }
 
-/// Clean up the canary container
-async fn cleanup_canary() {
-    let _ = Command::new("docker")
-        .args(["rm", "-f", CANARY_CONTAINER_NAME])
+/// Clean up a specific canary container with strict error checking
+///
+/// Unlike the old best-effort cleanup, this function:
+/// 1. Checks if the container exists first
+/// 2. Reports errors instead of silently ignoring them
+/// 3. Logs cleanup actions for debugging
+async fn cleanup_canary_strict(ctx: &DeployContext, container_name: &str) -> Result<(), String> {
+    // Check if container exists
+    let check_result = Command::new("docker")
+        .args(["ps", "-a", "-q", "-f", &format!("name=^{}$", container_name)])
         .output()
-        .await;
+        .await
+        .map_err(|e| format!("Failed to check if container exists: {}", e))?;
+
+    if !check_result.status.success() {
+        return Err(format!(
+            "Failed to check container: {}",
+            String::from_utf8_lossy(&check_result.stderr)
+        ));
+    }
+
+    let container_id = String::from_utf8_lossy(&check_result.stdout).trim().to_string();
+    if container_id.is_empty() {
+        // Container doesn't exist, nothing to clean up
+        return Ok(());
+    }
+
+    // Container exists, remove it
+    ctx.log_stdout(&format!(">>> docker rm -f {}", container_name)).await;
+
+    let rm_result = Command::new("docker")
+        .args(["rm", "-f", container_name])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute docker rm: {}", e))?;
+
+    if rm_result.status.success() {
+        ctx.log_stdout(&format!("✓ Removed canary container: {}", container_name)).await;
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&rm_result.stderr);
+        Err(format!("Failed to remove container {}: {}", container_name, stderr))
+    }
 }
 
 /// Post-deploy monitoring: watch the production container for issues after deployment
